@@ -41,9 +41,13 @@ Federation, the trust/CA service, and group messaging are planned for later stag
 
 ### Prerequisites
 
-- Go 1.22+
+- Go 1.26.5
 - Docker and Docker Compose
-- `golang-migrate` CLI (for running schema migrations)
+- `golang-migrate` CLI, installed as `migrate`:
+  ```bash
+  go install -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@latest
+  ```
+  If your binary is named differently, override it: `make MIGRATE=your-name migrate-up`.
 
 ### Setup
 
@@ -51,7 +55,17 @@ Federation, the trust/CA service, and group messaging are planned for later stag
 git clone https://github.com/quietly-messenger/quietly-server.git
 cd quietly-server
 cp .env.example .env
+```
 
+**Edit `.env` before going further.** `DATABASE_URL` ships as a placeholder and will not connect as-is. For the local Compose setup, the matching value is:
+
+```
+DATABASE_URL=postgresql://quietly:quietly@localhost:5432/quietly?sslmode=disable
+```
+
+Compose reads the same `.env`, so if you change `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, or `POSTGRES_PORT`, keep `DATABASE_URL` consistent with them.
+
+```bash
 # start Postgres
 docker compose up -d
 
@@ -63,6 +77,8 @@ make run
 ```
 
 The server listens on `:8080` by default (configurable, see below).
+
+The server itself reads only the process environment; it never opens `.env`. Locally, the `Makefile` loads `.env` and exports it before running. In deployment, configuration comes from systemd `Environment=` or whatever supervisor you use — no `.env` file is involved.
 
 ### Common commands
 
@@ -106,18 +122,32 @@ The server is configured entirely through environment variables. See `.env.examp
 
 ## API
 
-Requests are authenticated by having each device sign its requests with its identity key — there's no password or session token. Request/response shapes are defined under `api/` and will move to Protobuf as the schema stabilizes; until then, expect plain JSON over HTTPS.
+**The normative specification is [`api/v1/PROTOCOL.md`](./api/v1/PROTOCOL.md).** It defines every byte on the wire — key formats, binary layouts, KDF inputs, error codes, and limits. Where this README and that document disagree, the specification is right.
+
+Most requests are authenticated by having each device sign them with its Ed25519 identity key — there is no password and no session token. Message submission is the exception: it is unauthenticated by design, because a signature would identify the sender and defeat sealed sender. It is gated by a per-device delivery token instead.
 
 Endpoints at MVP stage:
 
-- `POST /accounts` — register a new account
-- `POST /devices` — register a device (identity key, signed prekey, one-time prekeys)
-- `GET /devices/{user_id}/{device_id}/prekey-bundle` — fetch a prekey bundle to start a session
-- `POST /messages` — submit an encrypted message for a recipient device
-- `GET /messages` — fetch queued messages for the authenticated device
-- `POST /messages/{id}/ack` — acknowledge and delete a delivered message
+| Endpoint | Auth |
+|---|---|
+| `GET /v1/accounts/pow-params` | none |
+| `POST /v1/accounts` | PoW + self-signed device 1 |
+| `POST /v1/devices` | existing device |
+| `GET /v1/devices` | device |
+| `DELETE /v1/devices/{device_id}` | device |
+| `GET /v1/users/{username}` | device |
+| `GET /v1/devices/{user_id}/{device_id}/prekey-bundle` | device |
+| `GET /v1/devices/{user_id}/{device_id}/delivery-token` | device |
+| `POST /v1/devices/{device_id}/prekeys` | that device |
+| `PUT /v1/devices/{device_id}/signed-prekey` | that device |
+| `PUT /v1/devices/{device_id}/delivery-token` | that device |
+| `PUT /v1/devices/{device_id}/push-endpoint` | that device |
+| `POST /v1/messages` | **none** — delivery token |
+| `GET /v1/messages` | device |
+| `POST /v1/messages/{id}/ack` | device |
+| `GET /v1/ws` | device |
 
-This list will grow and the exact shapes aren't final.
+JSON over HTTPS. Protobuf is a later optimization, once the schema stops moving.
 
 ## Roadmap
 
