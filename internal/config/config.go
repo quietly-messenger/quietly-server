@@ -53,7 +53,7 @@ type Limits struct {
 func DefaultLimits() Limits {
 	return Limits{
 		MessageTTLDays:        30,
-		PowDifficulty:         18,
+		PowDifficulty:         20,
 		AuthSkewMs:            60_000,
 		PowWindowMs:           300_000,
 		MaxDevicesPerAccount:  5,

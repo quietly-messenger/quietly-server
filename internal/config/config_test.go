@@ -191,7 +191,7 @@ func TestPowDifficulty(t *testing.T) {
 		want    int
 		wantErr bool
 	}{
-		{name: "spec default", value: "18", want: 18},
+		{name: "spec default", value: "20", want: 20},
 		{name: "lower bound", value: "1", want: 1},
 		{name: "upper bound", value: "32", want: 32},
 		{name: "unset", value: "", wantErr: true},

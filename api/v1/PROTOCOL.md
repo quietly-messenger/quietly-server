@@ -178,6 +178,11 @@ Difficulty is server configuration and may be raised without a client release. C
 
 It raises the cost of bulk account creation. It does not prevent a determined attacker with hardware from registering many accounts, and it is not a substitute for rate limiting. It exists because identity is username-only and there is no phone number to make accounts expensive.
 
+Two consequences are normative for deployments:
+
+- The proof is **stateless and bankable**. It is only bounded by `pow_window_ms`, so one solve can be submitted repeatedly within the window and solves can be stockpiled in advance. Difficulty alone therefore cannot bound the registration rate: per-IP throttling (§15) is mandatory, and deployments open to public registration SHOULD raise `difficulty` well above the default and add screening a proof of work cannot provide (an external CAPTCHA, an invite gate, or manual approval).
+- A server-issued, short-lived challenge nonce that binds each solve to a recent issuance — removing the stockpiling and replay window — is reserved for v2 (§16). Until then, difficulty is a speed bump, not a gate.
+
 ---
 
 ## 5. Request authentication
@@ -393,6 +398,8 @@ AD = IK_A_dh || IK_A_sig || IK_B_dh || IK_B_sig      (128 bytes)
 B receives an initial message (§9.2) carrying `IK_A_dh`, `IK_A_sig`, `EK_A`, `spk_id`, and `otpk_id`. It looks up the referenced private keys, computes the same four DH values with roles reversed, derives the identical `SK` and `AD`, and initializes its ratchet.
 
 If `otpk_id` refers to a prekey B has already consumed or never had, B MUST attempt the three-DH derivation. If that also fails to authenticate, the message is dropped.
+
+**Responder session store (normative).** A responder MUST keep at most one live session per peer device — keyed on `(sender_user_id, sender_device_id)` — and MUST deduplicate on envelope `id` before establishing anything. Delivery is at-least-once (§11.2), so an initial message whose ack was lost will be redelivered; it must be decrypted against the session that already processed it (which rejects the consumed message key, and the client discards the duplicate silently) rather than by running the responder derivation again. A second responder session for the same peer forks the ratchet and strands everything the first session produces. Establish a fresh session only when none exists for that peer, or when the peer presents a new identity key (§2.0.1).
 
 ### 8.4 Initialization
 
@@ -643,7 +650,7 @@ Ordering within a device queue is by `id`. Ordering *within a conversation* is t
 Unauthenticated. Fetched immediately before solving.
 
 ```json
-{ "v": "quietly/1", "algorithm": "sha256-leading-zero-bits", "difficulty": 18, "window_ms": 300000 }
+{ "v": "quietly/1", "algorithm": "sha256-leading-zero-bits", "difficulty": 20, "window_ms": 300000 }
 ```
 
 ### 12.2 `POST /v1/accounts`
@@ -891,7 +898,7 @@ Error responses MUST NOT leak whether a username exists beyond what `user_not_fo
 | `message_ttl_days` | 30 | undelivered messages expire |
 | `auth_skew_ms` | ±60 000 | request timestamp window |
 | `nonce_cache_ms` | 120 000 | twice the skew window |
-| `pow_difficulty` | 18 bits | server config, raisable without a client release |
+| `pow_difficulty` | 20 bits | server config, raisable without a client release; raise well above this before opening public registration (§4.3) |
 | `pow_window_ms` | ±300 000 | solving takes time |
 | `spk_rotation_days` | 3 | signed prekey rotation; short to bound §7.2.1 exposure |
 | `spk_grace_days` | 3 | previous signed prekey stays valid |
@@ -916,6 +923,8 @@ Reserved now so that adding them is not a breaking change:
 - **`session_type`** (§10.2) — `0x00` pairwise. Group sessions take `0x01`.
 - **`group_id`** (§10.2) — 16 bytes, all zero at v1.
 - **Sender certificates** (§10.4) — would add a signed sender assertion inside the sealed payload.
+- **Server-issued PoW challenges** (§4) — a short-lived challenge nonce binding each solve to a recent issuance, closing the stockpiling window.
+- **Traffic shaping** (§17) — padding and cover traffic; small deployments are trivially correlatable without them.
 - **Federation** — `user_id` is globally unique as a UUID, so a future `domain` field on the envelope routes cross-server without changing identity.
 - **Protobuf** — the JSON shapes here map one-to-one; the binary layouts (§9, §10) are already final and would be unaffected.
 
@@ -933,6 +942,7 @@ The server **can** observe:
 - The recipient of every message, its size, and its timing. Traffic analysis over these three is the primary residual attack.
 - Which devices are connected by WebSocket, and when — an online-presence signal, even though presence is never exposed via the API.
 - The IP address of every request, including unauthenticated submissions.
+- The push endpoint URL a device registers: the push provider (and anything on the path to it) learns that URL, including any identity a client embeds in it. Clients SHOULD register opaque, rotatable topics and treat the endpoint as provider-visible metadata (§12.12).
 
 The server **cannot** observe:
 
@@ -942,6 +952,8 @@ The server **cannot** observe:
 - Anything from the push wakeup (§13.3), which is why the push provider is untrusted infrastructure rather than a trusted component.
 
 Not addressed at v1, and not claimed: cover traffic, padding to a fixed size, timing obfuscation, or protection against a global passive adversary correlating both ends.
+
+Deployment reality belongs on this list too. Any reverse proxy, load balancer, TLS terminator, or container platform in front of the home server **logs source IP addresses and request times unless explicitly configured not to**. The register above describes the protocol, not the deployment; an operator's logging configuration is part of the metadata story, and self-hosting is only as private as the box it runs on.
 
 ### 17.1 Accepted residual risks
 

@@ -2,13 +2,14 @@
 
 Server-side of [Quietly](https://github.com/quietly-messenger) — a messenger with Telegram-level UX and a Signal/Matrix-level security model. This repo is the home server: account and device registry, encrypted message store-and-forward, and (eventually) federation.
 
-The server never sees plaintext. It stores and routes ciphertext, device keys, and encrypted media blobs, and that's it. All encryption/decryption happens on the client.
+The server never sees plaintext. It stores and routes ciphertext and device keys, and that's it. All encryption/decryption happens on the client.
 
 > **Status:** the MVP home server (accounts, devices, prekeys, delivery tokens,
-> message store-and-forward, WebSocket delivery, PoW), the trust service, and the
-> federation gateway are implemented per `api/v1/PROTOCOL.md`. Not yet a stable
-> release — the API and schema may still change, and federation is a documented
-> first cut (see `docs/FEDERATION.md`).
+> message store-and-forward, WebSocket delivery, PoW) is implemented per
+> `api/v1/PROTOCOL.md`. The trust service and federation gateway are an
+> **experimental first cut** — inbound verification only, described in
+> `docs/FEDERATION.md` rather than the protocol spec. Not yet a stable release:
+> the API and schema may still change.
 
 ## Contents
 
@@ -28,10 +29,9 @@ At MVP, this server handles:
 
 - **Account & device registry** — username-based accounts (no phone/email), per-device identity keys, signed prekeys, and one-time prekey batches for X3DH.
 - **Message store-and-forward** — clients upload encrypted messages addressed to a specific recipient device; the server queues them until the device fetches and acks. Undelivered messages expire after ~30 days.
-- **Media storage** — encrypted attachments, referenced by opaque IDs.
 - **Push triggers** — wakes up a client via UnifiedPush or a persistent connection, without revealing anything about the message content.
 
-Federation, the trust/CA service, and group messaging are planned for later stages and are not part of the current build. The full protocol and architecture writeup lives in the [org-level docs](https://github.com/quietly-messenger).
+Federation (trust service + gateway) ships as an experimental first cut, inbound-verification only. **Group messaging, encrypted media/attachments, calls, and encrypted backups are planned, not implemented** — they appear in the org-level plans and `CLIENT_DESIGN.md` as milestones, and have no endpoints or protocol chapters yet. The full protocol and architecture writeup lives in the [org-level docs](https://github.com/quietly-messenger).
 
 ## Tech stack
 
@@ -155,6 +155,7 @@ The server is configured entirely through environment variables. See `.env.examp
 | `DATABASE_URL` | Postgres connection string | — |
 | `MESSAGE_TTL_DAYS` | offline message expiry | `30` |
 | `LOG_LEVEL` | `debug`/`info`/`warn`/`error` | `info` |
+| `POW_DIFFICULTY` | account-creation proof-of-work leading zero bits (raise before public registration — §4.3) | `20` |
 | `TLS_CERT_FILE` / `TLS_KEY_FILE` | terminate TLS 1.3 in-process (or leave unset behind a TLS proxy) | — |
 | `BUNDLE_FETCH_PER_HOUR` | per-requesting-device prekey-bundle limit | `60` |
 | `REQUESTS_PER_MINUTE` | per-IP request limit for the HTTP surface | `120` |
@@ -164,6 +165,8 @@ The server is configured entirely through environment variables. See `.env.examp
 The trust service additionally uses `TRUST_ADMIN_TOKEN` (required — admin bearer token for issuing/revoking certificates), `TRUST_PRIVATE_KEY`, `TRUST_STATE_PATH`, and the gateway uses `TRUST_PUBLIC_KEY` and `TRUST_URL`.
 
 **TLS.** `PROTOCOL.md` §1 requires HTTPS on every client connection. Either set `TLS_CERT_FILE`/`TLS_KEY_FILE` (TLS 1.3 is enforced) or run the server behind a TLS terminator such as Caddy or nginx. The same applies to `trust` and `gateway` for server-to-server links; the reference Compose setup keeps those internal/localhost-only until you configure certificates.
+
+**Deployment privacy.** Anything in front of the server — a reverse proxy, load balancer, or container platform — logs source IPs and request times unless you configure it not to. The protocol minimizes what the server *needs* to know; your logging configuration decides what it *keeps*. See `PROTOCOL.md` §17.
 
 ## API
 
