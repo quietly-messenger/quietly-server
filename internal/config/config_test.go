@@ -301,6 +301,38 @@ func TestLogLevel(t *testing.T) {
 	}
 }
 
+func TestDeliveryJitterMs(t *testing.T) {
+	restoreLogLevel(t)
+	setValidEnv(t)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Limits.DeliveryJitterMs != 0 {
+		t.Fatalf("DeliveryJitterMs = %d, want 0 when unset", cfg.Limits.DeliveryJitterMs)
+	}
+
+	t.Setenv("DELIVERY_JITTER_MS", "250")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Limits.DeliveryJitterMs != 250 {
+		t.Fatalf("DeliveryJitterMs = %d, want 250", cfg.Limits.DeliveryJitterMs)
+	}
+
+	// Above the §15 hard cap it clamps rather than being honored.
+	t.Setenv("DELIVERY_JITTER_MS", "99999")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Limits.DeliveryJitterMs != 5000 {
+		t.Fatalf("DeliveryJitterMs = %d, want 5000 (capped)", cfg.Limits.DeliveryJitterMs)
+	}
+}
+
 // TestErrorsNameTheOffendingVariable checks that every failure path says which
 // environment variable is wrong, and names one that actually exists. Reading
 // "strconv.Atoi: parsing \"abc\"" at three in the morning tells you nothing

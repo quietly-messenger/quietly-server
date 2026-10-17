@@ -784,6 +784,12 @@ Authenticated. Returns queued messages for the calling device, oldest first.
 
 Query: `limit` (default 100, max `fetch_limit_max`).
 
+Only messages whose release time has arrived (`not_before <= now`, §15
+`delivery_jitter_ms`) are returned; a message held by the delivery-jitter
+window surfaces on the first fetch after that time. Ordering stays
+`(server_ts, id)` and `remaining` reflects undelivered messages not yet
+returned by this response.
+
 ```json
 { "v": "quietly/1", "messages": [ /* envelopes per §11 */ ], "remaining": 0 }
 ```
@@ -895,6 +901,7 @@ Error responses MUST NOT leak whether a username exists beyond what `user_not_fo
 | `otp_replenish_threshold` | 20 | client tops up below this |
 | `otp_max_stored` | 200 | server cap per device |
 | `sealed_blob_max` | 64 KiB | text-only milestone; `payload_too_large` above |
+| `delivery_jitter_ms` | 0 | max randomized hold before a message is fetchable/notifiable (0 disables; hard cap 5000) — §17, TASK-001 B |
 | `message_ttl_days` | 30 | undelivered messages expire |
 | `auth_skew_ms` | ±60 000 | request timestamp window |
 | `nonce_cache_ms` | 120 000 | twice the skew window |
@@ -997,7 +1004,7 @@ The server **cannot** observe:
 - Whether a message is 1:1 or group, once groups exist (§10.2).
 - Anything from the push wakeup (§13.3), which is why the push provider is untrusted infrastructure rather than a trusted component.
 
-Not addressed, and not claimed: cover traffic, timing obfuscation, or protection against a global passive adversary correlating both ends. Size padding (§16.1) removes the length signal but does nothing about *who* talks to *whom* or *when*; the remaining signals are the ones a low-traffic deployment makes easy to correlate.
+Not addressed, and not claimed: cover traffic, or protection against a global passive adversary correlating both ends. Size padding (§16.1) removes the length signal. Delivery jitter (§15 `delivery_jitter_ms`) inserts a server-side randomized hold between enqueue and delivery, which weakens upload↔delivery timing correlation; it is a **partial** mitigation, not a fix: a *client-side* delay before upload is a no-op against a network observer (it moves the observable event itself — both ends shift together, so the correlation gap is unchanged), and with no cover traffic a low-traffic deployment remains trivially correlatable. The remaining signals are *who* talks to *whom* and *when*.
 
 Deployment reality belongs on this list too. Any reverse proxy, load balancer, TLS terminator, or container platform in front of the home server **logs source IP addresses and request times unless explicitly configured not to**. The register above describes the protocol, not the deployment; an operator's logging configuration is part of the metadata story, and self-hosting is only as private as the box it runs on.
 
@@ -1015,3 +1022,4 @@ Stated so they are decisions rather than oversights:
 | Hand-written protocol implementation | Mitigated by test vectors and property tests, not by external audit. **No third-party review has been done.** Required before any public beta. |
 | Initial vs normal messages differ by ~104 B of overhead (§16.1) | Accepted: padding quantizes to the bucket set but does not merge the two message families. |
 | Size padding adds ~4 KiB worst-case for messages near the top of a bucket (§16.1) | Accepted as the cost of removing the length signal; buckets are configurable client-side. |
+| Delivery jitter is partial (§15) | Accepted: a randomized server-side hold weakens but does not break timing correlation. Cover traffic is a separate, later task. |

@@ -92,6 +92,7 @@ func enqueueDelivery(ctx context.Context, store deliveryStore, limits config.Lim
 		RecipientDeviceID: d.Request.Recipient.DeviceID,
 		Sealed:            d.Request.Sealed,
 		ServerTS:          now,
+		NotBefore:         message.NotBefore(now, limits.DeliveryJitterMs, nil),
 		TTLExpiresAt:      now.Add(time.Duration(limits.MessageTTLDays) * 24 * time.Hour),
 	}
 	return store.EnqueueMessage(ctx, m)

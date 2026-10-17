@@ -113,6 +113,25 @@ func TestSubmitCollapsesRecipientFailures(t *testing.T) {
 	}
 }
 
+func TestNotBefore(t *testing.T) {
+	now := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
+
+	if got := message.NotBefore(now, 0, nil); !got.Equal(now) {
+		t.Fatalf("NotBefore(0) = %v, want %v", got, now)
+	}
+	if got := message.NotBefore(now, -5, nil); !got.Equal(now) {
+		t.Fatalf("NotBefore(-5) = %v, want %v", got, now)
+	}
+	full := func(n int) int { return n - 1 } // max of [0, jitterMs]
+	if got := message.NotBefore(now, 1000, full); !got.Equal(now.Add(time.Second)) {
+		t.Fatalf("NotBefore(full) = %v, want %v", got, now.Add(time.Second))
+	}
+	zero := func(n int) int { return 0 }
+	if got := message.NotBefore(now, 1000, zero); !got.Equal(now) {
+		t.Fatalf("NotBefore(zero) = %v, want %v", got, now)
+	}
+}
+
 func TestFetchDefaultsTo100AndCapsAtMax(t *testing.T) {
 	_, svc, limits, alice, _ := newFixture(t)
 	ctx := context.Background()
@@ -123,13 +142,13 @@ func TestFetchDefaultsTo100AndCapsAtMax(t *testing.T) {
 			V:         api.Version,
 			Recipient: api.Recipient{UserID: alice.UserID, DeviceID: alice.DeviceID},
 			Sealed:    make([]byte, 16),
-		}, alice.Token, base.Add(time.Duration(i)*time.Millisecond)); err != nil {
+		}, alice.Token, base.Add(time.Duration(i-105)*time.Millisecond)); err != nil {
 			t.Fatalf("submit %d: %v", i, err)
 		}
 	}
 
 	// No limit: §12.14 default of 100, with remaining=1 signalling more.
-	resp, err := svc.Fetch(ctx, alice.UserID, alice.DeviceID, 0)
+	resp, err := svc.Fetch(ctx, alice.UserID, alice.DeviceID, time.Now(), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +164,7 @@ func TestFetchDefaultsTo100AndCapsAtMax(t *testing.T) {
 	}
 
 	// Above fetch_limit_max is clamped, not an error.
-	resp, err = svc.Fetch(ctx, alice.UserID, alice.DeviceID, limits.FetchLimitMax+1000)
+	resp, err = svc.Fetch(ctx, alice.UserID, alice.DeviceID, time.Now(), limits.FetchLimitMax+1000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +173,7 @@ func TestFetchDefaultsTo100AndCapsAtMax(t *testing.T) {
 	}
 
 	// Explicit limit is honored.
-	resp, err = svc.Fetch(ctx, alice.UserID, alice.DeviceID, 3)
+	resp, err = svc.Fetch(ctx, alice.UserID, alice.DeviceID, time.Now(), 3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +213,7 @@ func TestAckIsIdempotentAndScopedToRecipient(t *testing.T) {
 		t.Fatalf("ack unknown: %v", err)
 	}
 
-	list, err := store.ListMessages(ctx, alice.UserID, alice.DeviceID, 10)
+	list, err := store.ListMessages(ctx, alice.UserID, alice.DeviceID, time.Now(), 10)
 	if err != nil {
 		t.Fatal(err)
 	}

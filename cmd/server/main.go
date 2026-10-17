@@ -17,6 +17,7 @@ import (
 	"github.com/quietly-messenger/quietly-server/internal/config"
 	"github.com/quietly-messenger/quietly-server/internal/device"
 	"github.com/quietly-messenger/quietly-server/internal/message"
+	"github.com/quietly-messenger/quietly-server/internal/notify"
 	"github.com/quietly-messenger/quietly-server/internal/push"
 	"github.com/quietly-messenger/quietly-server/internal/storage"
 	"github.com/quietly-messenger/quietly-server/internal/storage/postgres"
@@ -65,7 +66,16 @@ func main() {
 	dispatcher := push.NewDispatcher(store)
 	hub.SetWake(dispatcher.Enqueue)
 
-	srv := transporthttp.NewServer(accountSvc, deviceSvc, messageSvc, limits, hub, cfg.TrustedProxies)
+	// Message notifications are released at each message's not_before (§15
+	// delivery_jitter_ms, TASK-001 B) via a bounded scheduler; on boot, recover
+	// notifications still unreleased at the previous shutdown.
+	scheduler := notify.New(hub.NotifyMessage, 10000)
+	defer scheduler.Close()
+	if err := scheduler.Recover(ctx, store); err != nil {
+		slog.Error("recover pending notifications", "error", err)
+	}
+
+	srv := transporthttp.NewServer(accountSvc, deviceSvc, messageSvc, limits, hub, scheduler.Schedule, cfg.TrustedProxies)
 	nonces := auth.NewNonceCache(time.Duration(limits.AuthSkewMs*2) * time.Millisecond)
 	handler := srv.Router(store, time.Duration(limits.AuthSkewMs)*time.Millisecond, nonces)
 

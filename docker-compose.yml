@@ -53,6 +53,7 @@ services:
       DATABASE_URL: ${DATABASE_URL}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       MESSAGE_TTL_DAYS: ${MESSAGE_TTL_DAYS:-30}
+      DELIVERY_JITTER_MS: ${DELIVERY_JITTER_MS:-0}
       POW_DIFFICULTY: ${POW_DIFFICULTY:-20}
       BUNDLE_FETCH_PER_HOUR: ${BUNDLE_FETCH_PER_HOUR:-60}
       REQUESTS_PER_MINUTE: ${REQUESTS_PER_MINUTE:-120}
@@ -102,6 +103,7 @@ services:
       # Same §15 envelope limits as the server (audit F-25).
       MESSAGE_TTL_DAYS: ${MESSAGE_TTL_DAYS:-30}
       SEALED_BLOB_MAX: ${SEALED_BLOB_MAX:-65536}
+      DELIVERY_JITTER_MS: ${DELIVERY_JITTER_MS:-0}
       # Per-peer delivery budget (audit F-03 residual).
       S2S_REQUESTS_PER_MINUTE: ${S2S_REQUESTS_PER_MINUTE:-300}
     ports:

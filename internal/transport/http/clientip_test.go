@@ -69,7 +69,7 @@ func TestRateLimitXFFKeying(t *testing.T) {
 		t.Helper()
 		limits := config.DefaultLimits()
 		limits.RequestsPerMinute = 2 // burst of 2: the third request must 429
-		return NewServer(nil, nil, nil, limits, nil, trusted)
+		return NewServer(nil, nil, nil, limits, nil, nil, trusted)
 	}
 	run := func(s *Server, remote string, xff func(i int) string) []int {
 		h := s.rateLimit(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

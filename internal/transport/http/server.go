@@ -32,20 +32,33 @@ type Server struct {
 	messages       *message.Service
 	limits         config.Limits
 	hub            *ws.Hub
+	notify         Notifier
 	ipLimiter      *ratelimit.Limiter
 	bundleLimiter  *ratelimit.Limiter
 	trustedProxies []*net.IPNet
 }
 
+// Notifier delivers a message notification no earlier than `when`. A nil
+// Notifier (in tests) means immediate delivery via the hub.
+type Notifier func(userID string, deviceID int, env api.Envelope, when time.Time)
+
 // NewServer builds the handler bundle. trustedProxies lists the peers whose
 // X-Forwarded-For header may be honored for rate-limit keying (empty: never).
-func NewServer(accounts *account.Service, devices *device.Service, messages *message.Service, limits config.Limits, hub *ws.Hub, trustedProxies []*net.IPNet) *Server {
+// notify (may be nil) receives each message notification with its release
+// time; it defaults to immediate hub delivery.
+func NewServer(accounts *account.Service, devices *device.Service, messages *message.Service, limits config.Limits, hub *ws.Hub, notify Notifier, trustedProxies []*net.IPNet) *Server {
+	if notify == nil {
+		notify = func(userID string, deviceID int, env api.Envelope, _ time.Time) {
+			hub.NotifyMessage(userID, deviceID, env)
+		}
+	}
 	return &Server{
 		accounts:       accounts,
 		devices:        devices,
 		messages:       messages,
 		limits:         limits,
 		hub:            hub,
+		notify:         notify,
 		ipLimiter:      ratelimit.New(float64(limits.RequestsPerMinute)/60.0, limits.RequestsPerMinute, 10000),
 		bundleLimiter:  ratelimit.New(float64(limits.BundleFetchPerHour)/3600.0, limits.BundleFetchPerHour, 10000),
 		trustedProxies: trustedProxies,
@@ -363,8 +376,8 @@ func (s *Server) submitMessage(w http.ResponseWriter, r *http.Request) {
 		ServerTS:     m.ServerTS.UnixMilli(),
 		TTLExpiresAt: m.TTLExpiresAt.UnixMilli(),
 	}
-	if s.hub != nil {
-		s.hub.NotifyMessage(req.Recipient.UserID, req.Recipient.DeviceID, env)
+	if s.notify != nil {
+		s.notify(req.Recipient.UserID, req.Recipient.DeviceID, env, m.NotBefore)
 	}
 	api.WriteJSON(w, http.StatusAccepted, &api.MessageSubmitResponse{V: api.Version, ID: m.ID, ServerTS: m.ServerTS.UnixMilli()})
 }
@@ -377,7 +390,7 @@ func (s *Server) fetchMessages(w http.ResponseWriter, r *http.Request) {
 			limit = n
 		}
 	}
-	resp, err := s.messages.Fetch(r.Context(), dev.UserID, dev.ID, limit)
+	resp, err := s.messages.Fetch(r.Context(), dev.UserID, dev.ID, time.Now(), limit)
 	if err != nil {
 		api.WriteError(w, err)
 		return

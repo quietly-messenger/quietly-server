@@ -161,6 +161,7 @@ The server is configured entirely through environment variables. See `.env.examp
 | `POW_DIFFICULTY` | account-creation proof-of-work leading zero bits (raise before public registration — §4.3) | `20` |
 | `TLS_CERT_FILE` / `TLS_KEY_FILE` | terminate TLS 1.3 in-process (or leave unset behind a TLS proxy) | — |
 | `BUNDLE_FETCH_PER_HOUR` | per-requesting-device prekey-bundle limit | `60` |
+| `DELIVERY_JITTER_MS` | max server-side hold before a message is delivered (0 disables; partial timing mitigation — §17) | `0` |
 | `REQUESTS_PER_MINUTE` | per-IP request limit for the HTTP surface | `120` |
 | `TRUSTED_PROXIES` | IPs/CIDRs of reverse proxies whose `X-Forwarded-For` may key the per-IP limiter (empty: header always ignored — audit F-23) | empty |
 | `WS_PING_INTERVAL_S` / `WS_IDLE_TIMEOUT_S` | WebSocket keepalive / idle close | `30` / `90` |

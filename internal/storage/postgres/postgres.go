@@ -410,20 +410,23 @@ func (s *Store) EnqueueMessage(ctx context.Context, m *storage.Message) error {
 	if m.ID == "" {
 		m.ID = s.ulid.Next()
 	}
+	if m.NotBefore.IsZero() {
+		m.NotBefore = m.ServerTS
+	}
 	_, err := s.pool.Exec(ctx,
-		`INSERT INTO messages (id, recipient_user_id, recipient_device_id, sealed, server_ts, ttl_expires_at)
-		 VALUES ($1, $2, $3, $4, $5, $6)`,
-		m.ID, m.RecipientUserID, m.RecipientDeviceID, m.Sealed, m.ServerTS, m.TTLExpiresAt)
+		`INSERT INTO messages (id, recipient_user_id, recipient_device_id, sealed, server_ts, not_before, ttl_expires_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		m.ID, m.RecipientUserID, m.RecipientDeviceID, m.Sealed, m.ServerTS, m.NotBefore, m.TTLExpiresAt)
 	return err
 }
 
-func (s *Store) ListMessages(ctx context.Context, userID string, deviceID int, limit int) ([]storage.Message, error) {
+func (s *Store) ListMessages(ctx context.Context, userID string, deviceID int, now time.Time, limit int) ([]storage.Message, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT id, recipient_user_id::text, recipient_device_id, sealed, server_ts, ttl_expires_at
+		`SELECT id, recipient_user_id::text, recipient_device_id, sealed, server_ts, not_before, ttl_expires_at
 		 FROM messages
-		 WHERE recipient_user_id = $1 AND recipient_device_id = $2
-		 ORDER BY server_ts, id LIMIT $3`,
-		userID, deviceID, limit)
+		 WHERE recipient_user_id = $1 AND recipient_device_id = $2 AND not_before <= $3
+		 ORDER BY server_ts, id LIMIT $4`,
+		userID, deviceID, now, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -432,7 +435,32 @@ func (s *Store) ListMessages(ctx context.Context, userID string, deviceID int, l
 	var out []storage.Message
 	for rows.Next() {
 		var m storage.Message
-		if err := rows.Scan(&m.ID, &m.RecipientUserID, &m.RecipientDeviceID, &m.Sealed, &m.ServerTS, &m.TTLExpiresAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.RecipientUserID, &m.RecipientDeviceID, &m.Sealed, &m.ServerTS, &m.NotBefore, &m.TTLExpiresAt); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// PendingMessages returns future-due messages (not_before > now) ordered by
+// release time, for post-restart notification recovery (TASK-001 B).
+func (s *Store) PendingMessages(ctx context.Context, now time.Time, limit int) ([]storage.Message, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, recipient_user_id::text, recipient_device_id, sealed, server_ts, not_before, ttl_expires_at
+		 FROM messages
+		 WHERE not_before > $1
+		 ORDER BY not_before, id LIMIT $2`,
+		now, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []storage.Message
+	for rows.Next() {
+		var m storage.Message
+		if err := rows.Scan(&m.ID, &m.RecipientUserID, &m.RecipientDeviceID, &m.Sealed, &m.ServerTS, &m.NotBefore, &m.TTLExpiresAt); err != nil {
 			return nil, err
 		}
 		out = append(out, m)

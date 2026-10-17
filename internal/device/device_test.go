@@ -269,7 +269,7 @@ func TestRevokePurgesQueuedMessages(t *testing.T) {
 	if err := svc.Revoke(ctx, alice.UserID, alice.DeviceID); err != nil {
 		t.Fatalf("revoke: %v", err)
 	}
-	list, err := store.ListMessages(ctx, alice.UserID, alice.DeviceID, 10)
+	list, err := store.ListMessages(ctx, alice.UserID, alice.DeviceID, time.Now(), 10)
 	if err != nil {
 		t.Fatal(err)
 	}

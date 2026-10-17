@@ -455,6 +455,7 @@ func TestMessageLifecycle(t *testing.T) {
 	}
 
 	ts := time.Now().UTC().Truncate(time.Millisecond)
+	later := ts.Add(time.Hour) // a "now" after every enqueued message is due
 	enqueue := func(deviceID int, sealed string, serverTS time.Time, ttl time.Duration) *storage.Message {
 		t.Helper()
 		m := &storage.Message{
@@ -483,14 +484,14 @@ func TestMessageLifecycle(t *testing.T) {
 		t.Fatalf("ids not unique: %q %q %q", m1.ID, m2.ID, m3.ID)
 	}
 
-	msgs, err := st.ListMessages(ctx, u.ID, 1, 2)
+	msgs, err := st.ListMessages(ctx, u.ID, 1, later, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(msgs) != 2 || msgs[0].ID != m1.ID || msgs[1].ID != m2.ID {
 		t.Fatalf("limit 2 returned %v, want [%s %s]", ids(msgs), m1.ID, m2.ID)
 	}
-	msgs, err = st.ListMessages(ctx, u.ID, 1, 100)
+	msgs, err = st.ListMessages(ctx, u.ID, 1, later, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -523,7 +524,7 @@ func TestMessageLifecycle(t *testing.T) {
 	if n != 1 {
 		t.Fatalf("DeleteExpiredMessages = %d, want 1", n)
 	}
-	msgs, err = st.ListMessages(ctx, u.ID, 1, 100)
+	msgs, err = st.ListMessages(ctx, u.ID, 1, later, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -532,7 +533,7 @@ func TestMessageLifecycle(t *testing.T) {
 	}
 
 	// The other device's queue is untouched by all of the above.
-	msgs, err = st.ListMessages(ctx, u.ID, 2, 100)
+	msgs, err = st.ListMessages(ctx, u.ID, 2, ts, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -546,6 +547,54 @@ func TestMessageLifecycle(t *testing.T) {
 		ServerTS: ts, TTLExpiresAt: ts.Add(time.Hour)}
 	if err := st.EnqueueMessage(ctx, bad); err == nil {
 		t.Fatal("enqueue for unknown device succeeded")
+	}
+}
+
+// TestMessageNotBeforeAndPending covers TASK-001 B at the SQL layer: fetch
+// returns only released rows, and PendingMessages returns only unreleased ones.
+func TestMessageNotBeforeAndPending(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	u, _ := mustAccount(t, st, "nadia")
+	now := time.Now().UTC().Truncate(time.Millisecond)
+
+	due := &storage.Message{RecipientUserID: u.ID, RecipientDeviceID: 1, Sealed: []byte("due"),
+		ServerTS: now.Add(-time.Minute), NotBefore: now.Add(-time.Minute), TTLExpiresAt: now.Add(time.Hour)}
+	future := &storage.Message{RecipientUserID: u.ID, RecipientDeviceID: 1, Sealed: []byte("future"),
+		ServerTS: now, NotBefore: now.Add(time.Minute), TTLExpiresAt: now.Add(time.Hour)}
+	if err := st.EnqueueMessage(ctx, due); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.EnqueueMessage(ctx, future); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.ListMessages(ctx, u.ID, 1, now, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ID != due.ID {
+		t.Fatalf("released list = %v, want [%s]", ids(got), due.ID)
+	}
+
+	pend, err := st.PendingMessages(ctx, now, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pend) != 1 || pend[0].ID != future.ID {
+		t.Fatalf("pending = %v, want [%s]", ids(pend), future.ID)
+	}
+
+	// After the release time the future row is fetchable and no longer pending.
+	got, err = st.ListMessages(ctx, u.ID, 1, now.Add(2*time.Minute), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("after release: %v, want 2", ids(got))
+	}
+	if pend, err = st.PendingMessages(ctx, now.Add(2*time.Minute), 100); err != nil || len(pend) != 0 {
+		t.Fatalf("pending after release = %v (err %v), want empty", ids(pend), err)
 	}
 }
 
@@ -597,7 +646,7 @@ func TestRevokeDevicePurgesQueuedMessages(t *testing.T) {
 	if n := countRows(t, st, `SELECT count(*) FROM messages WHERE recipient_user_id = $1 AND recipient_device_id = 1`, u.ID); n != 0 {
 		t.Fatalf("revoked device still has %d queued messages", n)
 	}
-	msgs, err := st.ListMessages(ctx, u.ID, 2, 100)
+	msgs, err := st.ListMessages(ctx, u.ID, 2, ts, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -611,7 +660,7 @@ func TestRevokeDevicePurgesQueuedMessages(t *testing.T) {
 	if err := st.DeleteMessagesForDevice(ctx, u.ID, 2); err != nil {
 		t.Fatal(err)
 	}
-	msgs, err = st.ListMessages(ctx, u.ID, 2, 100)
+	msgs, err = st.ListMessages(ctx, u.ID, 2, ts, 100)
 	if err != nil {
 		t.Fatal(err)
 	}

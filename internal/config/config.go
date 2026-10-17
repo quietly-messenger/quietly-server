@@ -50,6 +50,7 @@ type Limits struct {
 	SPKGraceDays          int // previous signed prekey stays valid
 	DeliveryTokenBytes    int
 	BundleFetchPerHour    int // per-requesting-device bundle fetch limit (§15)
+	DeliveryJitterMs      int // max hold before a message is fetchable (§15)
 	RequestsPerMinute     int // per-IP general request limit
 	WsPingIntervalS       int // server control-ping cadence
 	WsIdleTimeoutS        int // close an idle socket after this
@@ -73,6 +74,7 @@ func DefaultLimits() Limits {
 		SPKGraceDays:          3,
 		DeliveryTokenBytes:    32,
 		BundleFetchPerHour:    60,
+		DeliveryJitterMs:      0,
 		RequestsPerMinute:     120,
 		WsPingIntervalS:       30,
 		WsIdleTimeoutS:        90,
@@ -242,6 +244,12 @@ func LoadLimits() Limits {
 	}
 	if v := envInt("BUNDLE_FETCH_PER_HOUR"); v > 0 {
 		l.BundleFetchPerHour = v
+	}
+	if v := envInt("DELIVERY_JITTER_MS"); v > 0 {
+		if v > 5000 {
+			v = 5000 // §15 hard cap
+		}
+		l.DeliveryJitterMs = v
 	}
 	if v := envInt("REQUESTS_PER_MINUTE"); v > 0 {
 		l.RequestsPerMinute = v

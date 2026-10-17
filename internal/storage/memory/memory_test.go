@@ -9,6 +9,40 @@ import (
 	"github.com/quietly-messenger/quietly-server/internal/storage"
 )
 
+// TestMessagesRespectNotBefore covers the TASK-001 B fetch/pending split.
+func TestMessagesRespectNotBefore(t *testing.T) {
+	s := New()
+	ctx := context.Background()
+	now := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
+
+	s.messages["past"] = &storage.Message{ID: "past", RecipientUserID: "u", RecipientDeviceID: 1, NotBefore: now.Add(-time.Hour)}
+	s.messages["future"] = &storage.Message{ID: "future", RecipientUserID: "u", RecipientDeviceID: 1, NotBefore: now.Add(time.Hour)}
+
+	future, err := s.PendingMessages(ctx, now, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(future) != 1 || future[0].ID != "future" {
+		t.Fatalf("PendingMessages = %v, want [future]", idsOf(future))
+	}
+
+	due, err := s.ListMessages(ctx, "u", 1, now, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(due) != 1 || due[0].ID != "past" {
+		t.Fatalf("ListMessages = %v, want [past]", idsOf(due))
+	}
+}
+
+func idsOf(ms []storage.Message) []string {
+	var out []string
+	for _, m := range ms {
+		out = append(out, m.ID)
+	}
+	return out
+}
+
 // TestPrunePreKeyIssuances covers the F-02 residual in the in-memory store:
 // records older than the cutoff are dropped, fresh ones survive, and the
 // returned count reflects what was removed.

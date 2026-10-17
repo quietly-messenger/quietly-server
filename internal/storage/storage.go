@@ -59,6 +59,7 @@ type Message struct {
 	RecipientDeviceID int
 	Sealed            []byte
 	ServerTS          time.Time
+	NotBefore         time.Time // release time for fetch/notify (§15 delivery_jitter_ms)
 	TTLExpiresAt      time.Time
 }
 
@@ -95,8 +96,11 @@ type Store interface {
 
 	// Messages
 	EnqueueMessage(ctx context.Context, m *Message) error
-	ListMessages(ctx context.Context, userID string, deviceID int, limit int) ([]Message, error)
+	ListMessages(ctx context.Context, userID string, deviceID int, now time.Time, limit int) ([]Message, error)
 	AckMessage(ctx context.Context, userID string, deviceID int, id string) error
 	DeleteMessagesForDevice(ctx context.Context, userID string, deviceID int) error
 	DeleteExpiredMessages(ctx context.Context, now time.Time) (int, error)
+	// PendingMessages returns messages whose release time is still in the
+	// future (not_before > now), for scheduling post-restart notifications.
+	PendingMessages(ctx context.Context, now time.Time, limit int) ([]Message, error)
 }

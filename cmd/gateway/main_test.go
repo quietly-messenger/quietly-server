@@ -87,6 +87,21 @@ func TestEnqueueDeliveryEnforcesEnvelopeLimits(t *testing.T) {
 		if !store.m.ServerTS.Equal(now) {
 			t.Fatalf("ServerTS = %v, want %v", store.m.ServerTS, now)
 		}
+		if !store.m.NotBefore.Equal(now) {
+			t.Fatalf("NotBefore = %v, want %v (jitter 0)", store.m.NotBefore, now)
+		}
+	})
+
+	t.Run("delivery jitter sets not_before", func(t *testing.T) {
+		jittered := limits
+		jittered.DeliveryJitterMs = 5000
+		store := &fakeDeliveryStore{}
+		if err := enqueueDelivery(ctx, store, jittered, delivery([]byte("sealed!!")), now); err != nil {
+			t.Fatalf("enqueue: %v", err)
+		}
+		if store.m.NotBefore.Before(now) || store.m.NotBefore.After(now.Add(5000*time.Millisecond)) {
+			t.Fatalf("NotBefore = %v, want within [%v, %v]", store.m.NotBefore, now, now.Add(5000*time.Millisecond))
+		}
 	})
 
 	t.Run("storage failure surfaces as a plain error", func(t *testing.T) {

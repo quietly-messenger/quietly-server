@@ -409,16 +409,19 @@ func (s *Store) EnqueueMessage(_ context.Context, m *storage.Message) error {
 	if _, ok := s.devices[deviceKey{userID: m.RecipientUserID, id: m.RecipientDeviceID}]; !ok {
 		return fmt.Errorf("recipient device does not exist")
 	}
+	if m.NotBefore.IsZero() {
+		m.NotBefore = m.ServerTS
+	}
 	s.messages[m.ID] = cloneMessage(m)
 	return nil
 }
 
-func (s *Store) ListMessages(_ context.Context, userID string, deviceID int, limit int) ([]storage.Message, error) {
+func (s *Store) ListMessages(_ context.Context, userID string, deviceID int, now time.Time, limit int) ([]storage.Message, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	var out []storage.Message
 	for _, m := range s.messages {
-		if m.RecipientUserID == userID && m.RecipientDeviceID == deviceID {
+		if m.RecipientUserID == userID && m.RecipientDeviceID == deviceID && !m.NotBefore.After(now) {
 			out = append(out, *cloneMessage(m))
 		}
 	}
@@ -427,6 +430,29 @@ func (s *Store) ListMessages(_ context.Context, userID string, deviceID int, lim
 			return out[i].ID < out[j].ID
 		}
 		return out[i].ServerTS.Before(out[j].ServerTS)
+	})
+	if limit >= 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// PendingMessages returns future-due messages ordered by release time
+// (TASK-001 B).
+func (s *Store) PendingMessages(_ context.Context, now time.Time, limit int) ([]storage.Message, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var out []storage.Message
+	for _, m := range s.messages {
+		if m.NotBefore.After(now) {
+			out = append(out, *cloneMessage(m))
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].NotBefore.Equal(out[j].NotBefore) {
+			return out[i].ID < out[j].ID
+		}
+		return out[i].NotBefore.Before(out[j].NotBefore)
 	})
 	if limit >= 0 && len(out) > limit {
 		out = out[:limit]

@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"math/rand/v2"
 	"time"
 
 	"github.com/quietly-messenger/quietly-server/internal/api"
@@ -17,11 +18,27 @@ import (
 type Service struct {
 	store  storage.Store
 	limits config.Limits
+	jitter func(n int) int // returns an int in [0,n); nil means uniform
 }
 
 // New builds a message service.
 func New(store storage.Store, limits config.Limits) *Service {
-	return &Service{store: store, limits: limits}
+	return &Service{store: store, limits: limits, jitter: func(n int) int { return rand.IntN(n) }}
+}
+
+// NotBefore computes a message's release time: the enqueue time plus a uniform
+// hold in [0, jitterMs] ms (inclusive). jitterMs <= 0 returns now unchanged.
+// rng(n) must return an int in [0, n); nil uses a uniform default. This is the
+// single code path for both C2S submission and the federation gateway
+// (TASK-001 B).
+func NotBefore(now time.Time, jitterMs int, rng func(n int) int) time.Time {
+	if jitterMs <= 0 {
+		return now
+	}
+	if rng == nil {
+		rng = func(n int) int { return rand.IntN(n) }
+	}
+	return now.Add(time.Duration(rng(jitterMs+1)) * time.Millisecond)
 }
 
 func tokenHash(token []byte) []byte {
@@ -71,6 +88,7 @@ func (s *Service) Submit(ctx context.Context, req api.MessageSubmit, token []byt
 		RecipientDeviceID: req.Recipient.DeviceID,
 		Sealed:            req.Sealed,
 		ServerTS:          now,
+		NotBefore:         NotBefore(now, s.limits.DeliveryJitterMs, s.jitter),
 		TTLExpiresAt:      now.Add(time.Duration(s.limits.MessageTTLDays) * 24 * time.Hour),
 	}
 	if err := s.store.EnqueueMessage(ctx, m); err != nil {
@@ -79,8 +97,10 @@ func (s *Service) Submit(ctx context.Context, req api.MessageSubmit, token []byt
 	return m, nil
 }
 
-// Fetch returns the queued messages for a device, oldest first (§12.14).
-func (s *Service) Fetch(ctx context.Context, userID string, deviceID, limit int) (*api.MessagesResponse, error) {
+// Fetch returns the queued messages for a device, oldest first (§12.14). Only
+// messages whose release time has arrived (not_before <= now) are returned
+// (§15 delivery_jitter_ms).
+func (s *Service) Fetch(ctx context.Context, userID string, deviceID int, now time.Time, limit int) (*api.MessagesResponse, error) {
 	if limit <= 0 {
 		limit = DefaultFetchLimit
 	}
@@ -88,7 +108,7 @@ func (s *Service) Fetch(ctx context.Context, userID string, deviceID, limit int)
 		limit = s.limits.FetchLimitMax
 	}
 	// Fetch one extra to know whether more remain.
-	msgs, err := s.store.ListMessages(ctx, userID, deviceID, limit+1)
+	msgs, err := s.store.ListMessages(ctx, userID, deviceID, now, limit+1)
 	if err != nil {
 		return nil, api.Errorf(api.CodeInternalError, "message fetch failed")
 	}
