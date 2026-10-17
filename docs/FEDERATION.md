@@ -58,6 +58,12 @@ The request signature is the sender server's Ed25519 over
 A gateway accepts a delivery only when **all** of the following hold
 (`federation.VerifyDelivery`):
 
+0. the peer is within its request budget: `S2S_REQUESTS_PER_MINUTE` (default
+   300) per source address per minute, enforced *before* any crypto so a flood
+   spends bounded CPU. The limiter keys on the direct peer address and never
+   trusts `X-Forwarded-For` (the F-23 class of bug must not reappear here;
+   behind a TLS terminator all peers share one bucket, which still bounds
+   total cost);
 1. the certificate verifies against the trust-service public key and has not
    expired (`not_after`, with `MaxClockSkew` of grace);
 2. the certificate's domain is not revoked in the trust service's current view
@@ -104,7 +110,5 @@ recipient's queue.
   The trust service is a CA, not a directory; a directory (or domain-scoped
   usernames) is required before outbound routing works.
 - **Outbound routing** on the sending side (which gateway to POST to).
-- **S2S rate limits.** Replay is bounded (timestamp window + nonce cache), but
-  there is no per-peer request budget yet.
 
 Until these are resolved, federation is inbound-verification-only.

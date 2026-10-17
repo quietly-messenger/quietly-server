@@ -102,6 +102,8 @@ services:
       # Same §15 envelope limits as the server (audit F-25).
       MESSAGE_TTL_DAYS: ${MESSAGE_TTL_DAYS:-30}
       SEALED_BLOB_MAX: ${SEALED_BLOB_MAX:-65536}
+      # Per-peer delivery budget (audit F-03 residual).
+      S2S_REQUESTS_PER_MINUTE: ${S2S_REQUESTS_PER_MINUTE:-300}
     ports:
       # Localhost by default: terminate TLS in front before exposing to peers.
       - "127.0.0.1:${GATEWAY_PORT:-8082}:8082"

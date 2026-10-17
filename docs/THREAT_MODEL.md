@@ -96,6 +96,8 @@ request times unless deliberately configured not to (§17).
       ignored and every request keys on the proxy's own address).
 - [ ] Per-IP throttling (`REQUESTS_PER_MINUTE`) and the bundle-fetch limiter
       verified under load.
+- [ ] Federation gateway reachable only as intended, with its per-peer delivery
+      budget (`S2S_REQUESTS_PER_MINUTE`) sized for real peer traffic.
 - [ ] `POW_DIFFICULTY` raised above the default, plus screening a proof of
       work cannot provide (CAPTCHA, invite gate), before opening registration.
 - [ ] Backups treated like the database they copy (ciphertext + delivery

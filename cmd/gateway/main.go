@@ -13,8 +13,10 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +28,7 @@ import (
 	"github.com/quietly-messenger/quietly-server/internal/config"
 	"github.com/quietly-messenger/quietly-server/internal/federation"
 	"github.com/quietly-messenger/quietly-server/internal/message"
+	"github.com/quietly-messenger/quietly-server/internal/ratelimit"
 	"github.com/quietly-messenger/quietly-server/internal/storage"
 	"github.com/quietly-messenger/quietly-server/internal/storage/postgres"
 	"github.com/quietly-messenger/quietly-server/internal/transport/tlsconfig"
@@ -94,6 +97,84 @@ func enqueueDelivery(ctx context.Context, store deliveryStore, limits config.Lim
 	return store.EnqueueMessage(ctx, m)
 }
 
+// defaultS2SRequestsPerMinute bounds delivery requests per peer IP per minute
+// unless S2S_REQUESTS_PER_MINUTE overrides it. Peers authenticate before a
+// delivery is enqueued, but authentication itself (Ed25519 verification plus
+// hashing the body) is the CPU a flood spends, so the budget gates both
+// unauthenticated and authenticated traffic (audit F-03 residual).
+const defaultS2SRequestsPerMinute = 300
+
+// s2sRequestsPerMinute reads S2S_REQUESTS_PER_MINUTE, failing loud on an
+// invalid value: silently falling back would leave the budget at the default
+// while the operator believes it is configured.
+func s2sRequestsPerMinute() int {
+	v := os.Getenv("S2S_REQUESTS_PER_MINUTE")
+	if v == "" {
+		return defaultS2SRequestsPerMinute
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 {
+		slog.Error("S2S_REQUESTS_PER_MINUTE must be a positive number", "value", v)
+		os.Exit(1)
+	}
+	return n
+}
+
+// deliverHandler serves POST /deliver.
+type deliverHandler struct {
+	tsPub   []byte
+	revoked *revocationCache
+	replay  func(domain, nonce string) bool
+	store   deliveryStore
+	limits  config.Limits
+	limiter *ratelimit.Limiter
+}
+
+func (h *deliverHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !h.limiter.Allow(peerKey(r)) {
+		w.Header().Set("Retry-After", "60")
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+	var d federation.DeliveryRequest
+	if err := json.NewDecoder(r.Body).Decode(&d); err != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	if !federation.VerifyDelivery(h.tsPub, h.revoked.isRevoked, h.replay, time.Now(), d) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	if err := enqueueDelivery(r.Context(), h.store, h.limits, d, time.Now()); err != nil {
+		if ae := api.AsAPIError(err); ae != nil {
+			http.Error(w, ae.Message, ae.Status)
+			return
+		}
+		slog.Error("enqueue", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusAccepted)
+}
+
+// peerKey is the rate-limit key for the direct peer address. X-Forwarded-For
+// is deliberately ignored here for the same reason the HTTP server ignores it
+// from untrusted peers (audit F-23): any sender can set the header, so
+// honoring it would hand a flooder a fresh bucket per request. Behind a TLS
+// terminator every peer shares one bucket, which still bounds total cost.
+func peerKey(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	return host
+}
+
 func main() {
 	ctx := context.Background()
 
@@ -140,31 +221,14 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/deliver", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
-		var d federation.DeliveryRequest
-		if err := json.NewDecoder(r.Body).Decode(&d); err != nil {
-			http.Error(w, "invalid request", http.StatusBadRequest)
-			return
-		}
-		if !federation.VerifyDelivery(tsPub, revoked.isRevoked, replay, time.Now(), d) {
-			http.Error(w, "forbidden", http.StatusForbidden)
-			return
-		}
-		if err := enqueueDelivery(r.Context(), store, limits, d, time.Now()); err != nil {
-			if ae := api.AsAPIError(err); ae != nil {
-				http.Error(w, ae.Message, ae.Status)
-				return
-			}
-			slog.Error("enqueue", "error", err)
-			http.Error(w, "internal error", http.StatusInternalServerError)
-			return
-		}
-		w.WriteHeader(http.StatusAccepted)
+	perMinute := s2sRequestsPerMinute()
+	mux.Handle("/deliver", &deliverHandler{
+		tsPub:   tsPub,
+		revoked: revoked,
+		replay:  replay,
+		store:   store,
+		limits:  limits,
+		limiter: ratelimit.New(float64(perMinute)/60.0, perMinute, 10000),
 	})
 
 	addr := os.Getenv("GATEWAY_ADDR")
