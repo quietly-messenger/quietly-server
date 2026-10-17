@@ -3,6 +3,7 @@ package id
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestUUIDv4Format(t *testing.T) {
@@ -43,6 +44,21 @@ func TestULIDFormatAndMonotonic(t *testing.T) {
 		}
 		if prev != "" && u <= prev {
 			t.Fatalf("ulid not monotonic: %q <= %q", u, prev)
+		}
+		prev = u
+	}
+}
+
+// TestULIDMonotonicAcrossMilliseconds forces the clock to advance so the
+// generator must order across distinct millisecond timestamps (audit F-05).
+func TestULIDMonotonicAcrossMilliseconds(t *testing.T) {
+	g := NewULID()
+	prev := g.Next()
+	for i := 0; i < 200; i++ {
+		time.Sleep(2 * time.Millisecond)
+		u := g.Next()
+		if u <= prev {
+			t.Fatalf("ulid not monotonic across ms: %q <= %q", u, prev)
 		}
 		prev = u
 	}

@@ -79,6 +79,64 @@ func (s *Store) GetUser(ctx context.Context, userID string) (*storage.User, erro
 	return &u, nil
 }
 
+// CreateAccountWithDevice creates an account and its device 1 in a single
+// transaction, so a partial failure cannot leave a deviceless account (audit
+// F-10).
+func (s *Store) CreateAccountWithDevice(ctx context.Context, username string, d *storage.Device, prekeys []storage.OneTimePreKey) (*storage.User, *storage.Device, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	uid, err := id.UUIDv4()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var u storage.User
+	err = tx.QueryRow(ctx,
+		`INSERT INTO users (id, username) VALUES ($1, $2)
+		 RETURNING id::text, username, created_at`,
+		uid, username,
+	).Scan(&u.ID, &u.Username, &u.CreatedAt)
+	if err != nil {
+		return nil, nil, mapErr(err)
+	}
+
+	var deviceID int
+	err = tx.QueryRow(ctx,
+		`INSERT INTO devices
+		   (user_id, id, identity_key_dh, identity_key_sig, identity_binding,
+		    signed_prekey_id, signed_prekey, signed_prekey_sig, delivery_token, delivery_token_hash)
+		 VALUES ($1, (SELECT COALESCE(MAX(id),0)+1 FROM devices WHERE user_id = $1),
+		         $2, $3, $4, $5, $6, $7, $8, $9)
+		 RETURNING id`,
+		uid, d.IdentityKeyDH, d.IdentityKeySig, d.IdentityBinding,
+		d.SignedPreKeyID, d.SignedPreKey, d.SignedPreKeySig, d.DeliveryToken, d.DeliveryTokenHash,
+	).Scan(&deviceID)
+	if err != nil {
+		return nil, nil, mapErr(err)
+	}
+
+	for _, p := range prekeys {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO one_time_prekeys (device_user_id, device_id, prekey_id, public_key)
+			 VALUES ($1, $2, $3, $4)`,
+			uid, deviceID, p.ID, p.PublicKey,
+		); err != nil {
+			return nil, nil, mapErr(err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, nil, err
+	}
+	d.ID = deviceID
+	d.UserID = uid
+	return &u, d, nil
+}
+
 // --- Devices ---
 
 func (s *Store) CreateDevice(ctx context.Context, d *storage.Device, prekeys []storage.OneTimePreKey) (*storage.Device, error) {
@@ -131,12 +189,14 @@ func (s *Store) GetDevice(ctx context.Context, userID string, deviceID int) (*st
 	var revokedAt *time.Time
 	err := s.pool.QueryRow(ctx,
 		`SELECT id, user_id::text, identity_key_dh, identity_key_sig, identity_binding,
-		        signed_prekey_id, signed_prekey, signed_prekey_sig, delivery_token, delivery_token_hash,
+		        signed_prekey_id, signed_prekey, signed_prekey_sig, signed_prekey_rotated_at,
+		        delivery_token, delivery_token_hash,
 		        created_at, revoked_at, push_endpoint
 		 FROM devices WHERE user_id = $1 AND id = $2`,
 		userID, deviceID,
 	).Scan(&d.ID, &d.UserID, &d.IdentityKeyDH, &d.IdentityKeySig, &d.IdentityBinding,
-		&d.SignedPreKeyID, &d.SignedPreKey, &d.SignedPreKeySig, &d.DeliveryToken, &d.DeliveryTokenHash,
+		&d.SignedPreKeyID, &d.SignedPreKey, &d.SignedPreKeySig, &d.SignedPreKeyRotatedAt,
+		&d.DeliveryToken, &d.DeliveryTokenHash,
 		&d.CreatedAt, &revokedAt, &d.PushEndpoint)
 	if err != nil {
 		return nil, mapErr(err)
@@ -148,7 +208,8 @@ func (s *Store) GetDevice(ctx context.Context, userID string, deviceID int) (*st
 func (s *Store) ListDevices(ctx context.Context, userID string) ([]storage.Device, error) {
 	rows, err := s.pool.Query(ctx,
 		`SELECT id, user_id::text, identity_key_dh, identity_key_sig, identity_binding,
-		        signed_prekey_id, signed_prekey, signed_prekey_sig, delivery_token, delivery_token_hash,
+		        signed_prekey_id, signed_prekey, signed_prekey_sig, signed_prekey_rotated_at,
+		        delivery_token, delivery_token_hash,
 		        created_at, revoked_at, push_endpoint
 		 FROM devices WHERE user_id = $1 ORDER BY id`,
 		userID)
@@ -162,7 +223,8 @@ func (s *Store) ListDevices(ctx context.Context, userID string) ([]storage.Devic
 		var d storage.Device
 		var revokedAt *time.Time
 		if err := rows.Scan(&d.ID, &d.UserID, &d.IdentityKeyDH, &d.IdentityKeySig, &d.IdentityBinding,
-			&d.SignedPreKeyID, &d.SignedPreKey, &d.SignedPreKeySig, &d.DeliveryToken, &d.DeliveryTokenHash,
+			&d.SignedPreKeyID, &d.SignedPreKey, &d.SignedPreKeySig, &d.SignedPreKeyRotatedAt,
+			&d.DeliveryToken, &d.DeliveryTokenHash,
 			&d.CreatedAt, &revokedAt, &d.PushEndpoint); err != nil {
 			return nil, err
 		}
@@ -181,7 +243,13 @@ func (s *Store) CountActiveDevices(ctx context.Context, userID string) (int, err
 }
 
 func (s *Store) RevokeDevice(ctx context.Context, userID string, deviceID int) error {
-	ct, err := s.pool.Exec(ctx,
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	ct, err := tx.Exec(ctx,
 		`UPDATE devices SET revoked_at = now()
 		 WHERE user_id = $1 AND id = $2 AND revoked_at IS NULL`,
 		userID, deviceID)
@@ -191,12 +259,20 @@ func (s *Store) RevokeDevice(ctx context.Context, userID string, deviceID int) e
 	if ct.RowsAffected() == 0 {
 		return storage.ErrNotFound
 	}
-	return nil
+	// §2.2: revocation deletes the device's queued messages (audit F-11).
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM messages WHERE recipient_user_id = $1 AND recipient_device_id = $2`,
+		userID, deviceID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *Store) UpdateSignedPreKey(ctx context.Context, userID string, deviceID int, spkID uint32, spk, sig []byte) error {
 	ct, err := s.pool.Exec(ctx,
-		`UPDATE devices SET signed_prekey_id = $3, signed_prekey = $4, signed_prekey_sig = $5
+		`UPDATE devices
+		 SET signed_prekey_id = $3, signed_prekey = $4, signed_prekey_sig = $5,
+		     signed_prekey_rotated_at = now()
 		 WHERE user_id = $1 AND id = $2`,
 		userID, deviceID, spkID, spk, sig)
 	if err != nil {
@@ -238,15 +314,20 @@ func (s *Store) UpdatePushEndpoint(ctx context.Context, userID string, deviceID 
 // --- One-time prekeys ---
 
 func (s *Store) AddOneTimePreKeys(ctx context.Context, userID string, deviceID int, prekeys []storage.OneTimePreKey) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
 	for _, p := range prekeys {
-		if _, err := s.pool.Exec(ctx,
+		if _, err := tx.Exec(ctx,
 			`INSERT INTO one_time_prekeys (device_user_id, device_id, prekey_id, public_key)
 			 VALUES ($1, $2, $3, $4)`,
 			userID, deviceID, p.ID, p.PublicKey); err != nil {
 			return mapErr(err)
 		}
 	}
-	return nil
+	return tx.Commit(ctx)
 }
 
 func (s *Store) TakeOneTimePreKey(ctx context.Context, userID string, deviceID int) (*storage.OneTimePreKey, error) {
@@ -279,6 +360,40 @@ func (s *Store) CountAvailablePreKeys(ctx context.Context, userID string, device
 	return n, err
 }
 
+func (s *Store) GetPreKeyIssuance(ctx context.Context, requesterUserID string, requesterDeviceID int, targetUserID string, targetDeviceID int) (*storage.OneTimePreKey, time.Time, error) {
+	var p storage.OneTimePreKey
+	var at time.Time
+	err := s.pool.QueryRow(ctx,
+		`SELECT prekey_id, public_key, issued_at FROM prekey_issuances
+		 WHERE requester_user_id = $1 AND requester_device_id = $2
+		   AND target_user_id = $3 AND target_device_id = $4`,
+		requesterUserID, requesterDeviceID, targetUserID, targetDeviceID,
+	).Scan(&p.ID, &p.PublicKey, &at)
+	if err != nil {
+		return nil, time.Time{}, mapErr(err)
+	}
+	return &p, at, nil
+}
+
+func (s *Store) RecordPreKeyIssuance(ctx context.Context, requesterUserID string, requesterDeviceID int, targetUserID string, targetDeviceID int, prekey storage.OneTimePreKey) error {
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO prekey_issuances
+		   (requester_user_id, requester_device_id, target_user_id, target_device_id, prekey_id, public_key)
+		 VALUES ($1, $2, $3, $4, $5, $6)
+		 ON CONFLICT (requester_user_id, requester_device_id, target_user_id, target_device_id)
+		 DO UPDATE SET prekey_id = EXCLUDED.prekey_id, public_key = EXCLUDED.public_key, issued_at = now()`,
+		requesterUserID, requesterDeviceID, targetUserID, targetDeviceID, prekey.ID, prekey.PublicKey,
+	)
+	return err
+}
+
+func (s *Store) DeleteMessagesForDevice(ctx context.Context, userID string, deviceID int) error {
+	_, err := s.pool.Exec(ctx,
+		`DELETE FROM messages WHERE recipient_user_id = $1 AND recipient_device_id = $2`,
+		userID, deviceID)
+	return err
+}
+
 // --- Messages ---
 
 func (s *Store) EnqueueMessage(ctx context.Context, m *storage.Message) error {
@@ -296,7 +411,7 @@ func (s *Store) ListMessages(ctx context.Context, userID string, deviceID int, l
 	rows, err := s.pool.Query(ctx,
 		`SELECT id, recipient_user_id::text, recipient_device_id, sealed, server_ts, ttl_expires_at
 		 FROM messages
-		 WHERE recipient_user_id = $1 AND recipient_device_id = $2 AND NOT delivered
+		 WHERE recipient_user_id = $1 AND recipient_device_id = $2
 		 ORDER BY server_ts, id LIMIT $3`,
 		userID, deviceID, limit)
 	if err != nil {
@@ -336,7 +451,7 @@ func (s *Store) AckMessage(ctx context.Context, userID string, deviceID int, id 
 
 func (s *Store) DeleteExpiredMessages(ctx context.Context, now time.Time) (int, error) {
 	tag, err := s.pool.Exec(ctx,
-		`DELETE FROM messages WHERE ttl_expires_at <= $1 AND NOT delivered`, now)
+		`DELETE FROM messages WHERE ttl_expires_at <= $1`, now)
 	if err != nil {
 		return 0, err
 	}

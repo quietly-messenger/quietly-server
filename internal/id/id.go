@@ -75,7 +75,11 @@ func (g *ULID) Next() string {
 	copy(g.lastRnd[:], rnd[:])
 
 	var b [16]byte
-	binary.BigEndian.PutUint64(b[:8], ms)
+	// The ULID timestamp is 48 bits. Put ms into the top 48 bits (shifted up
+	// 16), then overwrite the low 10 bytes with randomness. Writing the full
+	// 64-bit ms would let the low 16 bits of the timestamp collide with the
+	// random bytes and break cross-millisecond monotonicity (audit F-05).
+	binary.BigEndian.PutUint64(b[:8], ms<<16)
 	copy(b[6:], rnd[:])
 	return encodeULID(b)
 }

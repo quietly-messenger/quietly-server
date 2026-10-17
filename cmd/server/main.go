@@ -53,28 +53,33 @@ func main() {
 	accountSvc := account.New(store, deviceSvc, limits)
 	messageSvc := message.New(store, limits)
 
-	hub := ws.NewHub()
+	hub := ws.NewHub(ws.Options{
+		PingInterval:   time.Duration(limits.WsPingIntervalS) * time.Second,
+		IdleTimeout:    time.Duration(limits.WsIdleTimeoutS) * time.Second,
+		AllowedOrigins: cfg.WsAllowedOrigins,
+	})
 	hub.SetAck(func(userID string, deviceID int, id string) error {
 		return messageSvc.Ack(context.Background(), userID, deviceID, id)
 	})
-	hub.SetWake(func(userID string, deviceID int) {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		d, err := store.GetDevice(ctx, userID, deviceID)
-		if err != nil || d.PushEndpoint == nil {
-			return
-		}
-		if err := push.Wake(ctx, http.DefaultClient, *d.PushEndpoint); err != nil {
-			slog.Debug("push wake", "error", err)
-		}
-	})
+	dispatcher := push.NewDispatcher(store)
+	hub.SetWake(dispatcher.Wake)
 
 	srv := transporthttp.NewServer(accountSvc, deviceSvc, messageSvc, limits, hub)
 	nonces := auth.NewNonceCache(time.Duration(limits.AuthSkewMs*2) * time.Millisecond)
 	handler := srv.Router(store, time.Duration(limits.AuthSkewMs)*time.Millisecond, nonces)
 
 	addr := netAddr(cfg)
-	httpServer := &http.Server{Addr: addr, Handler: handler}
+	// Timeouts bound slowloris and idle-body attacks (audit F-12). The
+	// WebSocket handler manages its own per-frame deadlines after hijacking
+	// the connection.
+	httpServer := &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    32 << 10,
+	}
 
 	go ttlCleanup(ctx, store, time.Hour)
 

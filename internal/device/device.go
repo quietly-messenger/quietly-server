@@ -5,6 +5,7 @@ package device
 import (
 	"context"
 	"crypto/sha256"
+	"time"
 
 	"github.com/quietly-messenger/quietly-crypto/identity"
 
@@ -78,10 +79,26 @@ func (s *Service) Register(ctx context.Context, userID string, reg api.DeviceReg
 // Create creates a device without the active-device limit check (used for
 // device 1 at account creation).
 func (s *Service) Create(ctx context.Context, userID string, reg api.DeviceRegistration) (*api.DeviceResponse, error) {
-	if err := VerifyRegistration(reg, s.limits.DeliveryTokenBytes); err != nil {
+	d, prekeys, err := s.PrepareDevice(userID, reg)
+	if err != nil {
 		return nil, err
 	}
+	created, err := s.store.CreateDevice(ctx, d, prekeys)
+	if err != nil {
+		if err == storage.ErrConflict {
+			return nil, api.Errorf(api.CodePrekeyIDConflict, "prekey id conflict")
+		}
+		return nil, api.Errorf(api.CodeInternalError, "device creation failed")
+	}
+	return &api.DeviceResponse{V: api.Version, DeviceID: created.ID}, nil
+}
 
+// PrepareDevice verifies a registration and builds the storage device and
+// prekeys without persisting them.
+func (s *Service) PrepareDevice(userID string, reg api.DeviceRegistration) (*storage.Device, []storage.OneTimePreKey, error) {
+	if err := VerifyRegistration(reg, s.limits.DeliveryTokenBytes); err != nil {
+		return nil, nil, err
+	}
 	d := &storage.Device{
 		UserID:            userID,
 		IdentityKeyDH:     reg.IdentityKeyDH,
@@ -97,15 +114,7 @@ func (s *Service) Create(ctx context.Context, userID string, reg api.DeviceRegis
 	for _, p := range reg.OneTimePrekeys {
 		prekeys = append(prekeys, storage.OneTimePreKey{ID: p.ID, PublicKey: p.PublicKey})
 	}
-
-	created, err := s.store.CreateDevice(ctx, d, prekeys)
-	if err != nil {
-		if err == storage.ErrConflict {
-			return nil, api.Errorf(api.CodePrekeyIDConflict, "prekey id conflict")
-		}
-		return nil, api.Errorf(api.CodeInternalError, "device creation failed")
-	}
-	return &api.DeviceResponse{V: api.Version, DeviceID: created.ID}, nil
+	return d, prekeys, nil
 }
 
 // List returns the account's devices (§12.4).
@@ -136,34 +145,51 @@ func (s *Service) Revoke(ctx context.Context, userID string, deviceID int) error
 	return nil
 }
 
+// otpIdempotencyWindow is the per-pair one-time-prekey re-fetch window
+// (PROTOCOL.md §15: otp_idempotency_window_h = 24).
+const otpIdempotencyWindow = 24 * time.Hour
+
 // PreKeyBundle returns the recipient's bundle, consuming one one-time prekey
-// (§7.2, §12.7).
-func (s *Service) PreKeyBundle(ctx context.Context, userID string, deviceID int) (*api.BundleResponse, error) {
-	d, err := s.store.GetDevice(ctx, userID, deviceID)
+// (§7.2, §12.7). Repeat fetches by the same requester within the idempotency
+// window return the same prekey (§7.2.1 mitigation 2). It also reports when the
+// target's signed prekey was installed so the caller can nudge the device when
+// rotation is due (§7.2.1 mitigation 4, audit F-02).
+func (s *Service) PreKeyBundle(ctx context.Context, requesterUserID string, requesterDeviceID int, targetUserID string, targetDeviceID int) (*api.BundleResponse, time.Time, error) {
+	d, err := s.store.GetDevice(ctx, targetUserID, targetDeviceID)
 	if err != nil {
 		if err == storage.ErrNotFound {
-			return nil, api.Errorf(api.CodeDeviceUnknown, "device unknown")
+			return nil, time.Time{}, api.Errorf(api.CodeDeviceUnknown, "device unknown")
 		}
-		return nil, api.Errorf(api.CodeInternalError, "device lookup failed")
+		return nil, time.Time{}, api.Errorf(api.CodeInternalError, "device lookup failed")
 	}
 	if d.RevokedAt != nil {
-		return nil, api.Errorf(api.CodeDeviceRevoked, "device revoked")
+		return nil, time.Time{}, api.Errorf(api.CodeDeviceRevoked, "device revoked")
 	}
 
-	otpk, err := s.store.TakeOneTimePreKey(ctx, userID, deviceID)
-	if err != nil && err != storage.ErrNotFound {
-		return nil, api.Errorf(api.CodeInternalError, "prekey fetch failed")
+	var otpk *storage.OneTimePreKey
+	if prev, at, err := s.store.GetPreKeyIssuance(ctx, requesterUserID, requesterDeviceID, targetUserID, targetDeviceID); err == nil && time.Since(at) < otpIdempotencyWindow {
+		otpk = prev
+	} else {
+		otpk, err = s.store.TakeOneTimePreKey(ctx, targetUserID, targetDeviceID)
+		if err != nil && err != storage.ErrNotFound {
+			return nil, time.Time{}, api.Errorf(api.CodeInternalError, "prekey fetch failed")
+		}
+		if otpk != nil {
+			if err := s.store.RecordPreKeyIssuance(ctx, requesterUserID, requesterDeviceID, targetUserID, targetDeviceID, *otpk); err != nil {
+				return nil, time.Time{}, api.Errorf(api.CodeInternalError, "prekey issuance failed")
+			}
+		}
 	}
 
-	remaining, err := s.store.CountAvailablePreKeys(ctx, userID, deviceID)
+	remaining, err := s.store.CountAvailablePreKeys(ctx, targetUserID, targetDeviceID)
 	if err != nil {
-		return nil, api.Errorf(api.CodeInternalError, "prekey count failed")
+		return nil, time.Time{}, api.Errorf(api.CodeInternalError, "prekey count failed")
 	}
 
 	resp := &api.BundleResponse{
 		V:                       api.Version,
-		UserID:                  userID,
-		DeviceID:                deviceID,
+		UserID:                  targetUserID,
+		DeviceID:                targetDeviceID,
 		IdentityKeyDH:           d.IdentityKeyDH,
 		IdentityKeySig:          d.IdentityKeySig,
 		IdentityBinding:         d.IdentityBinding,
@@ -174,7 +200,7 @@ func (s *Service) PreKeyBundle(ctx context.Context, userID string, deviceID int)
 	if otpk != nil {
 		resp.OneTimePrekey = &api.PreKey{ID: otpk.ID, PublicKey: otpk.PublicKey}
 	}
-	return resp, nil
+	return resp, d.SignedPreKeyRotatedAt, nil
 }
 
 // DeliveryToken returns the recipient device's current delivery token (§12.8).

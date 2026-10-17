@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 )
 
 type Config struct {
@@ -15,6 +16,11 @@ type Config struct {
 	MessageTTLDays int
 	PowDifficulty  int
 	LogLevel       slog.Level
+
+	// WsAllowedOrigins lists browser origins allowed to open /v1/ws
+	// (§13, WS_ALLOWED_ORIGINS, comma-separated). Native clients send no
+	// Origin header and are unaffected.
+	WsAllowedOrigins []string
 
 	// Limits holds the PROTOCOL.md §15 parameters. They are optional and
 	// defaulted; only SERVER_ADDR and DATABASE_URL are required.
@@ -36,9 +42,15 @@ type Limits struct {
 	SPKRotationDays       int // signed prekey rotation
 	SPKGraceDays          int // previous signed prekey stays valid
 	DeliveryTokenBytes    int
+	BundleFetchPerHour    int // per-requesting-device bundle fetch limit (§15)
+	RequestsPerMinute     int // per-IP general request limit
+	WsPingIntervalS       int // server control-ping cadence
+	WsIdleTimeoutS        int // close an idle socket after this
 }
 
-func defaultLimits() Limits {
+// DefaultLimits returns the documented §15 defaults, so callers (and tests)
+// can start from a complete, valid Limits value.
+func DefaultLimits() Limits {
 	return Limits{
 		MessageTTLDays:        30,
 		PowDifficulty:         18,
@@ -53,6 +65,10 @@ func defaultLimits() Limits {
 		SPKRotationDays:       3,
 		SPKGraceDays:          3,
 		DeliveryTokenBytes:    32,
+		BundleFetchPerHour:    60,
+		RequestsPerMinute:     120,
+		WsPingIntervalS:       30,
+		WsIdleTimeoutS:        90,
 	}
 }
 
@@ -138,6 +154,7 @@ func Load() (*Config, error) {
 	cfg.Limits = loadLimits()
 	cfg.Limits.MessageTTLDays = cfg.MessageTTLDays
 	cfg.Limits.PowDifficulty = cfg.PowDifficulty
+	cfg.WsAllowedOrigins = envList("WS_ALLOWED_ORIGINS")
 
 	return cfg, nil
 }
@@ -145,7 +162,7 @@ func Load() (*Config, error) {
 // loadLimits reads the optional §15 parameters from the environment, falling
 // back to the documented defaults for anything unset or unparseable.
 func loadLimits() Limits {
-	l := defaultLimits()
+	l := DefaultLimits()
 	if v := envInt("AUTH_SKEW_MS"); v > 0 {
 		l.AuthSkewMs = v
 	}
@@ -179,6 +196,18 @@ func loadLimits() Limits {
 	if v := envInt("DELIVERY_TOKEN_BYTES"); v > 0 {
 		l.DeliveryTokenBytes = v
 	}
+	if v := envInt("BUNDLE_FETCH_PER_HOUR"); v > 0 {
+		l.BundleFetchPerHour = v
+	}
+	if v := envInt("REQUESTS_PER_MINUTE"); v > 0 {
+		l.RequestsPerMinute = v
+	}
+	if v := envInt("WS_PING_INTERVAL_S"); v > 0 {
+		l.WsPingIntervalS = v
+	}
+	if v := envInt("WS_IDLE_TIMEOUT_S"); v > 0 {
+		l.WsIdleTimeoutS = v
+	}
 	return l
 }
 
@@ -194,4 +223,19 @@ func envInt(name string) int {
 		return 0
 	}
 	return n
+}
+
+// envList reads a comma-separated environment variable.
+func envList(name string) []string {
+	v := os.Getenv(name)
+	if v == "" {
+		return nil
+	}
+	var out []string
+	for _, item := range strings.Split(v, ",") {
+		if s := strings.TrimSpace(item); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }

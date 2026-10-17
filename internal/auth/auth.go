@@ -29,16 +29,32 @@ type DeviceStore interface {
 // maxBodyBytes bounds the request body read for signature verification.
 const maxBodyBytes = 1 << 20 // 1 MiB
 
-// NonceCache rejects replayed nonces within the auth window (§5.3).
+// nonceCacheMax bounds each nonce-cache generation. With two generations the
+// cache holds at most 2*nonceCacheMax entries regardless of traffic (audit
+// F-06).
+const nonceCacheMax = 1 << 16
+
+// NonceCache rejects replayed nonces within the auth window (§5.3). It keeps
+// two generations of bounded size: when the current generation fills, it
+// replaces the previous one. Memory is hard-bounded, and an entry is retained
+// for roughly one generation's worth of traffic (documented trade-off; a
+// restart still resets the window).
 type NonceCache struct {
-	mu     sync.Mutex
-	ttl    time.Duration
-	nonces map[string]time.Time
+	mu      sync.Mutex
+	ttl     time.Duration
+	max     int
+	current map[string]time.Time
+	prev    map[string]time.Time
 }
 
 // NewNonceCache returns a cache that remembers a nonce for ttl.
 func NewNonceCache(ttl time.Duration) *NonceCache {
-	return &NonceCache{ttl: ttl, nonces: make(map[string]time.Time)}
+	return &NonceCache{
+		ttl:     ttl,
+		max:     nonceCacheMax,
+		current: make(map[string]time.Time),
+		prev:    make(map[string]time.Time),
+	}
 }
 
 // CheckAndAdd reports whether nonce is fresh (not seen within the window) and
@@ -46,17 +62,17 @@ func NewNonceCache(ttl time.Duration) *NonceCache {
 func (c *NonceCache) CheckAndAdd(nonce string, now time.Time) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if exp, ok := c.nonces[nonce]; ok && now.Before(exp) {
+	if exp, ok := c.current[nonce]; ok && now.Before(exp) {
 		return false
 	}
-	if len(c.nonces) >= 8192 {
-		for n, exp := range c.nonces {
-			if now.After(exp) {
-				delete(c.nonces, n)
-			}
-		}
+	if exp, ok := c.prev[nonce]; ok && now.Before(exp) {
+		return false
 	}
-	c.nonces[nonce] = now.Add(c.ttl)
+	if len(c.current) >= c.max {
+		c.prev = c.current
+		c.current = make(map[string]time.Time, c.max)
+	}
+	c.current[nonce] = now.Add(c.ttl)
 	return true
 }
 

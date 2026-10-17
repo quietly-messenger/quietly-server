@@ -59,23 +59,24 @@ func (s *Service) Create(ctx context.Context, req api.AccountRequest) (*api.Acco
 		return nil, api.Errorf(api.CodePowInvalid, "proof of work does not meet difficulty")
 	}
 
-	user, err := s.store.CreateUser(ctx, req.Username)
+	// Create user + device 1 atomically (audit F-10): a failure here must not
+	// leave an account with no device.
+	d, prekeys, err := s.devices.PrepareDevice("", req.Device)
+	if err != nil {
+		return nil, err
+	}
+	createdUser, createdDevice, err := s.store.CreateAccountWithDevice(ctx, req.Username, d, prekeys)
 	if err != nil {
 		if err == storage.ErrConflict {
 			return nil, api.Errorf(api.CodeUsernameTaken, "username taken")
 		}
 		return nil, api.Errorf(api.CodeInternalError, "account creation failed")
 	}
-
-	dev, err := s.devices.Create(ctx, user.ID, req.Device)
-	if err != nil {
-		return nil, err
-	}
 	return &api.AccountResponse{
 		V:        api.Version,
-		UserID:   user.ID,
-		DeviceID: dev.DeviceID,
-		Username: user.Username,
+		UserID:   createdUser.ID,
+		DeviceID: createdDevice.ID,
+		Username: createdUser.Username,
 	}, nil
 }
 

@@ -26,19 +26,23 @@ type User struct {
 
 // Device is a device record (§2, §7).
 type Device struct {
-	ID                int
-	UserID            string
-	IdentityKeyDH     []byte // X25519 public
-	IdentityKeySig    []byte // Ed25519 public
-	IdentityBinding   []byte // signature over identity_key_dh
-	SignedPreKeyID    uint32
-	SignedPreKey      []byte
-	SignedPreKeySig   []byte
-	DeliveryToken     []byte // raw token, returned to senders; hash also stored
-	DeliveryTokenHash []byte // SHA-256(token), compared in constant time
-	CreatedAt         time.Time
-	RevokedAt         *time.Time
-	PushEndpoint      *string
+	ID              int
+	UserID          string
+	IdentityKeyDH   []byte // X25519 public
+	IdentityKeySig  []byte // Ed25519 public
+	IdentityBinding []byte // signature over identity_key_dh
+	SignedPreKeyID  uint32
+	SignedPreKey    []byte
+	SignedPreKeySig []byte
+	// SignedPreKeyRotatedAt is when the current signed prekey was installed.
+	// The server nudges the device when it is older than spk_rotation_days
+	// (§7.2.1 mitigation 4, audit F-02).
+	SignedPreKeyRotatedAt time.Time
+	DeliveryToken         []byte // raw token, returned to senders; hash also stored
+	DeliveryTokenHash     []byte // SHA-256(token), compared in constant time
+	CreatedAt             time.Time
+	RevokedAt             *time.Time
+	PushEndpoint          *string
 }
 
 // OneTimePreKey is an uploaded one-time prekey (§7).
@@ -64,6 +68,7 @@ type Message struct {
 type Store interface {
 	// Users
 	CreateUser(ctx context.Context, username string) (*User, error)
+	CreateAccountWithDevice(ctx context.Context, username string, d *Device, prekeys []OneTimePreKey) (*User, *Device, error)
 	GetUserByUsername(ctx context.Context, username string) (*User, error)
 	GetUser(ctx context.Context, userID string) (*User, error)
 
@@ -81,10 +86,13 @@ type Store interface {
 	AddOneTimePreKeys(ctx context.Context, userID string, deviceID int, prekeys []OneTimePreKey) error
 	TakeOneTimePreKey(ctx context.Context, userID string, deviceID int) (*OneTimePreKey, error)
 	CountAvailablePreKeys(ctx context.Context, userID string, deviceID int) (int, error)
+	GetPreKeyIssuance(ctx context.Context, requesterUserID string, requesterDeviceID int, targetUserID string, targetDeviceID int) (*OneTimePreKey, time.Time, error)
+	RecordPreKeyIssuance(ctx context.Context, requesterUserID string, requesterDeviceID int, targetUserID string, targetDeviceID int, prekey OneTimePreKey) error
 
 	// Messages
 	EnqueueMessage(ctx context.Context, m *Message) error
 	ListMessages(ctx context.Context, userID string, deviceID int, limit int) ([]Message, error)
 	AckMessage(ctx context.Context, userID string, deviceID int, id string) error
+	DeleteMessagesForDevice(ctx context.Context, userID string, deviceID int) error
 	DeleteExpiredMessages(ctx context.Context, now time.Time) (int, error)
 }

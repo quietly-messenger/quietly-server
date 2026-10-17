@@ -4,8 +4,11 @@ package http
 import (
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
+	"reflect"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -16,28 +19,41 @@ import (
 	"github.com/quietly-messenger/quietly-server/internal/config"
 	"github.com/quietly-messenger/quietly-server/internal/device"
 	"github.com/quietly-messenger/quietly-server/internal/message"
+	"github.com/quietly-messenger/quietly-server/internal/push"
+	"github.com/quietly-messenger/quietly-server/internal/ratelimit"
 	"github.com/quietly-messenger/quietly-server/internal/storage"
 	"github.com/quietly-messenger/quietly-server/internal/transport/ws"
 )
 
 // Server bundles the domain services and configuration for the HTTP handlers.
 type Server struct {
-	accounts *account.Service
-	devices  *device.Service
-	messages *message.Service
-	limits   config.Limits
-	hub      *ws.Hub
+	accounts      *account.Service
+	devices       *device.Service
+	messages      *message.Service
+	limits        config.Limits
+	hub           *ws.Hub
+	ipLimiter     *ratelimit.Limiter
+	bundleLimiter *ratelimit.Limiter
 }
 
 // NewServer builds the handler bundle.
 func NewServer(accounts *account.Service, devices *device.Service, messages *message.Service, limits config.Limits, hub *ws.Hub) *Server {
-	return &Server{accounts: accounts, devices: devices, messages: messages, limits: limits, hub: hub}
+	return &Server{
+		accounts:      accounts,
+		devices:       devices,
+		messages:      messages,
+		limits:        limits,
+		hub:           hub,
+		ipLimiter:     ratelimit.New(float64(limits.RequestsPerMinute)/60.0, limits.RequestsPerMinute, 10000),
+		bundleLimiter: ratelimit.New(float64(limits.BundleFetchPerHour)/3600.0, limits.BundleFetchPerHour, 10000),
+	}
 }
 
 // Router builds the chi router with all routes and middleware.
 func (s *Server) Router(store auth.DeviceStore, authSkew time.Duration, nonces *auth.NonceCache) http.Handler {
 	r := chi.NewRouter()
 	authMW := auth.Middleware(store, authSkew, nonces)
+	r.Use(s.rateLimit)
 
 	r.Route("/v1", func(r chi.Router) {
 		r.Get("/accounts/pow-params", s.powParams)
@@ -72,14 +88,37 @@ func (s *Server) powParams(w http.ResponseWriter, r *http.Request) {
 	api.WriteJSON(w, http.StatusOK, s.accounts.POWParams())
 }
 
+// rateLimit is the per-IP middleware (audit F-01).
+func (s *Server) rateLimit(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.ipLimiter.Allow("ip:" + clientIP(r)) {
+			w.Header().Set("Retry-After", "60")
+			api.WriteError(w, api.Errorf(api.CodeRateLimited, "rate limited"))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// clientIP extracts the client address, honoring X-Forwarded-For when present.
+func clientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		if i := strings.IndexByte(xff, ','); i >= 0 {
+			return strings.TrimSpace(xff[:i])
+		}
+		return strings.TrimSpace(xff)
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
 func (s *Server) createAccount(w http.ResponseWriter, r *http.Request) {
 	var req api.AccountRequest
 	if err := decodeJSON(w, r, &req); err != nil {
 		api.WriteError(w, err)
-		return
-	}
-	if req.V != api.Version {
-		api.WriteError(w, api.Errorf(api.CodeVersionMismatch, "version mismatch"))
 		return
 	}
 	resp, err := s.accounts.Create(r.Context(), req)
@@ -139,15 +178,32 @@ func (s *Server) lookupUser(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) preKeyBundle(w http.ResponseWriter, r *http.Request) {
+	dev := auth.DeviceFrom(r.Context())
+	if !s.bundleLimiter.Allow("bundle:" + dev.UserID + ":" + strconv.Itoa(dev.ID)) {
+		w.Header().Set("Retry-After", "3600")
+		api.WriteError(w, api.Errorf(api.CodeRateLimited, "bundle fetch limit reached"))
+		return
+	}
 	deviceID, err := pathInt(r, "device_id")
 	if err != nil {
 		api.WriteError(w, err)
 		return
 	}
-	resp, err := s.devices.PreKeyBundle(r.Context(), chi.URLParam(r, "user_id"), deviceID)
+	resp, spkRotatedAt, err := s.devices.PreKeyBundle(r.Context(), dev.UserID, dev.ID, chi.URLParam(r, "user_id"), deviceID)
 	if err != nil {
 		api.WriteError(w, err)
 		return
+	}
+	targetUserID := chi.URLParam(r, "user_id")
+	// If the fetch drove the target below the replenish threshold, warn the
+	// target device (§7.2.1 mitigation 3; audit F-02).
+	if resp.OneTimePrekeysRemaining < s.limits.OTPReplenishThreshold {
+		s.hub.NotifyPrekeysLow(targetUserID, deviceID, resp.OneTimePrekeysRemaining)
+	}
+	// Nudge the target when its signed prekey is overdue for rotation
+	// (§7.2.1 mitigation 4; audit F-02).
+	if time.Since(spkRotatedAt) > time.Duration(s.limits.SPKRotationDays)*24*time.Hour {
+		s.hub.NotifySPKRotate(targetUserID, deviceID)
 	}
 	api.WriteJSON(w, http.StatusOK, resp)
 }
@@ -237,6 +293,10 @@ func (s *Server) updatePushEndpoint(w http.ResponseWriter, r *http.Request) {
 	}
 	var endpoint *string
 	if req.Endpoint != "" {
+		if err := push.ValidateEndpoint(req.Endpoint); err != nil {
+			api.WriteError(w, api.Errorf(api.CodeInvalidPayload, "invalid push endpoint: %s", err))
+			return
+		}
 		endpoint = &req.Endpoint
 	}
 	if err := s.devices.UpdatePushEndpoint(r.Context(), dev.UserID, dev.ID, endpoint); err != nil {
@@ -278,7 +338,7 @@ func (s *Server) submitMessage(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) fetchMessages(w http.ResponseWriter, r *http.Request) {
 	dev := auth.DeviceFrom(r.Context())
-	limit := s.limits.FetchLimitMax
+	limit := 0 // service default: §12.14's 100
 	if l := r.URL.Query().Get("limit"); l != "" {
 		if n, err := strconv.Atoi(l); err == nil && n > 0 {
 			limit = n
@@ -327,10 +387,41 @@ func pathInt(r *http.Request, name string) (int, error) {
 	return n, nil
 }
 
+// maxRequestBody bounds every JSON request body.
+const maxRequestBody = 1 << 20 // 1 MiB
+
 func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
-	dec := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+	// Reject oversized bodies before decoding (audit F-12); chunked requests
+	// (ContentLength < 0) still fall back to the LimitReader.
+	if r.ContentLength > maxRequestBody {
+		return api.Errorf(api.CodePayloadTooLarge, "request body too large")
+	}
+	dec := json.NewDecoder(io.LimitReader(r.Body, maxRequestBody+1))
 	if err := dec.Decode(dst); err != nil {
 		return api.Errorf(api.CodeInvalidPayload, "invalid JSON body")
 	}
+	// §1: `v` appears in every request; a mismatch is a hard error (audit
+	// F-17). Reflection keeps this check in one place for all body types.
+	if v, ok := structVersion(dst); ok && v != api.Version {
+		return api.Errorf(api.CodeVersionMismatch, "version mismatch")
+	}
 	return nil
+}
+
+// structVersion returns the `v` field of a decoded request struct; ok is false
+// when the type has no such field.
+func structVersion(dst any) (string, bool) {
+	v := reflect.ValueOf(dst)
+	if v.Kind() != reflect.Pointer || v.IsNil() {
+		return "", false
+	}
+	v = v.Elem()
+	if v.Kind() != reflect.Struct {
+		return "", false
+	}
+	f := v.FieldByName("V")
+	if !f.IsValid() || f.Kind() != reflect.String {
+		return "", false
+	}
+	return f.String(), true
 }

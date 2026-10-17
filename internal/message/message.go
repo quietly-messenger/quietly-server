@@ -29,11 +29,18 @@ func tokenHash(token []byte) []byte {
 	return h[:]
 }
 
+// DefaultFetchLimit is the GET /v1/messages default when no limit is given
+// (PROTOCOL.md §12.14).
+const DefaultFetchLimit = 100
+
 // Submit stores an encrypted envelope for a recipient, gated by the recipient's
 // delivery token (§12.13). All recipient-state failures collapse to a single
 // delivery_rejected error to avoid an oracle. It returns the stored message.
 func (s *Service) Submit(ctx context.Context, req api.MessageSubmit, token []byte, now time.Time) (*storage.Message, error) {
-	if len(req.Sealed) == 0 || len(req.Sealed) > s.limits.SealedBlobMax {
+	if len(req.Sealed) == 0 {
+		return nil, api.Errorf(api.CodeInvalidPayload, "sealed blob is empty")
+	}
+	if len(req.Sealed) > s.limits.SealedBlobMax {
 		return nil, api.Errorf(api.CodePayloadTooLarge, "sealed blob exceeds limit")
 	}
 	if !validUUID(req.Recipient.UserID) {
@@ -63,7 +70,10 @@ func (s *Service) Submit(ctx context.Context, req api.MessageSubmit, token []byt
 
 // Fetch returns the queued messages for a device, oldest first (§12.14).
 func (s *Service) Fetch(ctx context.Context, userID string, deviceID, limit int) (*api.MessagesResponse, error) {
-	if limit <= 0 || limit > s.limits.FetchLimitMax {
+	if limit <= 0 {
+		limit = DefaultFetchLimit
+	}
+	if limit > s.limits.FetchLimitMax {
 		limit = s.limits.FetchLimitMax
 	}
 	// Fetch one extra to know whether more remain.
