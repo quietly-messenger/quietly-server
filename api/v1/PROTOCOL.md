@@ -984,7 +984,8 @@ be re-implemented in any client. The server never parses the framing; it only
 ever observes sealed-blob lengths that land in the bucket set.
 
 Cover traffic (fixed-rate decoy submissions) is **not** implemented and remains
-a documented residual in §17.
+a documented residual in §17; its design is sketched in
+`docs/COVER_TRAFFIC.md`.
 
 ---
 
