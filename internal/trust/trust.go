@@ -13,32 +13,45 @@ import (
 	"github.com/quietly-messenger/quietly-server/internal/federation"
 )
 
+// DefaultCertValidity is how long issued certificates last when the CA is
+// built without an explicit validity.
+const DefaultCertValidity = 90 * 24 * time.Hour
+
 // CA is the trust-service authority. It holds its own Ed25519 signing key and
 // an in-memory registry of issued certificates and revocations.
 type CA struct {
-	mu      sync.Mutex
-	tsPub   []byte
-	tsPriv  []byte
-	certs   map[string]federation.ServerCert
-	revoked map[string]bool
+	mu       sync.Mutex
+	tsPub    []byte
+	tsPriv   []byte
+	validity time.Duration
+	certs    map[string]federation.ServerCert
+	revoked  map[string]bool
 }
 
-// New builds a CA from the trust service's Ed25519 keypair.
-func New(tsPriv, tsPub []byte) *CA {
+// New builds a CA from the trust service's Ed25519 keypair. validity is how
+// long issued certificates last (renewal is re-issuing before expiry); it
+// defaults to DefaultCertValidity when not positive.
+func New(tsPriv, tsPub []byte, validity time.Duration) *CA {
+	if validity <= 0 {
+		validity = DefaultCertValidity
+	}
 	return &CA{
-		tsPriv:  tsPriv,
-		tsPub:   tsPub,
-		certs:   map[string]federation.ServerCert{},
-		revoked: map[string]bool{},
+		tsPriv:   tsPriv,
+		tsPub:    tsPub,
+		validity: validity,
+		certs:    map[string]federation.ServerCert{},
+		revoked:  map[string]bool{},
 	}
 }
 
 // PublicKey returns the trust service's public key.
 func (ca *CA) PublicKey() []byte { return ca.tsPub }
 
-// Issue signs and records a certificate for a server domain.
-func (ca *CA) Issue(domain string, serverPub []byte) (federation.ServerCert, error) {
-	cert, err := federation.SignCert(ca.tsPriv, domain, serverPub)
+// Issue signs and records a certificate for a server domain, valid from now
+// until now+validity (audit F-03 residual). Re-issuing a domain replaces the
+// previous certificate, which is the renewal path.
+func (ca *CA) Issue(domain string, serverPub []byte, now time.Time) (federation.ServerCert, error) {
+	cert, err := federation.SignCert(ca.tsPriv, domain, serverPub, now.Add(ca.validity))
 	if err != nil {
 		return federation.ServerCert{}, err
 	}

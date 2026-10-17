@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -44,7 +45,18 @@ func main() {
 	if statePath == "" {
 		statePath = "trust-state.json"
 	}
-	ca := trust.New(priv, pub)
+	// Certificates carry an expiry (audit F-03 residual). 90 days by default;
+	// renewing is re-issuing before the old certificate lapses.
+	validity := trust.DefaultCertValidity
+	if days := os.Getenv("TRUST_CERT_DAYS"); days != "" {
+		n, err := strconv.Atoi(days)
+		if err != nil || n <= 0 {
+			slog.Error("TRUST_CERT_DAYS must be a positive number of days", "value", days)
+			os.Exit(1)
+		}
+		validity = time.Duration(n) * 24 * time.Hour
+	}
+	ca := trust.New(priv, pub, validity)
 	if err := ca.Load(statePath); err != nil {
 		slog.Error("load CA state", "path", statePath, "error", err)
 		os.Exit(1)
@@ -92,7 +104,7 @@ func main() {
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request"})
 				return
 			}
-			cert, err := ca.Issue(body.Domain, body.PublicKey)
+			cert, err := ca.Issue(body.Domain, body.PublicKey, time.Now())
 			if err != nil {
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "issue failed"})
 				return

@@ -18,9 +18,18 @@ revocation list. Servers trust only certificates signed by the trust service.
 
 ## Certificate
 
-`ServerCert{ domain, public_key, signature }`, where `signature` is the trust
-service's Ed25519 signature over `domain || 0x00 || public_key`
-(`federation.SignCert` / `VerifyCert`).
+`ServerCert{ domain, public_key, not_after, signature }`, where `signature` is
+the trust service's Ed25519 signature over
+`domain || 0x00 || public_key || 0x00 || not_after` (`federation.SignCert` /
+`VerifyCert`).
+
+`not_after` is the expiry as Unix milliseconds and is **inside the signed
+payload**, so it cannot be extended without the trust service's key. The trust
+service issues certificates with a fixed validity (`TRUST_CERT_DAYS`, default
+90 days); renewal is re-issuing the domain, which replaces the stored
+certificate and clears its revocation flag. Gateways refuse certificates
+past `not_after` (plus `MaxClockSkew` of grace for clock drift), and a zero or
+missing expiry is malformed, not "valid forever" (audit F-03 residual).
 
 ## Delivery request
 
@@ -49,7 +58,8 @@ The request signature is the sender server's Ed25519 over
 A gateway accepts a delivery only when **all** of the following hold
 (`federation.VerifyDelivery`):
 
-1. the certificate verifies against the trust-service public key;
+1. the certificate verifies against the trust-service public key and has not
+   expired (`not_after`, with `MaxClockSkew` of grace);
 2. the certificate's domain is not revoked in the trust service's current view
    (the gateway polls `GET /servers` every 30 s and **fails closed** at boot
    until the first successful poll);
@@ -77,6 +87,9 @@ recipient's queue.
 - Issued certificates and revocations are persisted to `TRUST_STATE_PATH`
   (atomic write on every mutation) and reloaded at startup, so a restart cannot
   silently un-revoke a server.
+- Certificates expire (`TRUST_CERT_DAYS`, default 90 days). Renew a server by
+  re-issuing its domain: the new certificate replaces the old one and clears
+  any revocation flag, so un-revoking also requires a deliberate re-issue.
 - `GET /ca` and `GET /servers` are public (a directory is meant to be
   readable); they expose only public keys and revocation flags.
 - `trust` and `gateway` must speak TLS 1.3 to peers (`TLS_CERT_FILE` /

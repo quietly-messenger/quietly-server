@@ -19,7 +19,7 @@ func newDelivery(t *testing.T, now time.Time) (tsPub, tsPriv []byte, d federatio
 	if err != nil {
 		t.Fatal(err)
 	}
-	cert, err := federation.SignCert(ts.PrivateKey, "a.example", server.PublicKey)
+	cert, err := federation.SignCert(ts.PrivateKey, "a.example", server.PublicKey, now.Add(90*24*time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,7 +47,7 @@ func TestVerifyDeliveryAcceptsValidRequest(t *testing.T) {
 
 func TestVerifyDeliveryRejectsTampering(t *testing.T) {
 	now := time.Now()
-	tsPub, _, d := newDelivery(t, now)
+	tsPub, tsPriv, d := newDelivery(t, now)
 
 	t.Run("stale timestamp", func(t *testing.T) {
 		if federation.VerifyDelivery(tsPub, nil, nil, now.Add(federation.MaxClockSkew+time.Minute), d) {
@@ -88,6 +88,28 @@ func TestVerifyDeliveryRejectsTampering(t *testing.T) {
 			t.Fatal("cert accepted under a different trust key")
 		}
 	})
+	t.Run("expired certificate", func(t *testing.T) {
+		cert, err := federation.SignCert(tsPriv, "a.example", d.Cert.PublicKey, now.Add(-time.Hour))
+		if err != nil {
+			t.Fatal(err)
+		}
+		expired := d
+		expired.Cert = cert
+		if federation.VerifyDelivery(tsPub, nil, nil, now, expired) {
+			t.Fatal("expired certificate accepted")
+		}
+	})
+	t.Run("certificate within clock-skew grace", func(t *testing.T) {
+		cert, err := federation.SignCert(tsPriv, "a.example", d.Cert.PublicKey, now.Add(-time.Minute))
+		if err != nil {
+			t.Fatal(err)
+		}
+		grace := d
+		grace.Cert = cert
+		if !federation.VerifyDelivery(tsPub, nil, nil, now, grace) {
+			t.Fatal("certificate one minute past expiry rejected; MaxClockSkew grace should apply")
+		}
+	})
 }
 
 func TestVerifyDeliveryReplayProtection(t *testing.T) {
@@ -120,21 +142,42 @@ func TestVerifyCertRejectsMalformed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cert, err := federation.SignCert(ts.PrivateKey, "a.example", server.PublicKey)
+	now := time.Now()
+	cert, err := federation.SignCert(ts.PrivateKey, "a.example", server.PublicKey, now.Add(24*time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !federation.VerifyCert(ts.PublicKey, cert) {
+	if !federation.VerifyCert(ts.PublicKey, cert, now) {
 		t.Fatal("valid cert rejected")
 	}
 	short := cert
 	short.Signature = short.Signature[:32]
-	if federation.VerifyCert(ts.PublicKey, short) {
+	if federation.VerifyCert(ts.PublicKey, short, now) {
 		t.Fatal("short signature accepted")
 	}
 	moved := cert
 	moved.Domain = "b.example"
-	if federation.VerifyCert(ts.PublicKey, moved) {
+	if federation.VerifyCert(ts.PublicKey, moved, now) {
 		t.Fatal("domain swap accepted")
+	}
+	extended := cert
+	extended.NotAfter += 24 * time.Hour.Milliseconds()
+	if federation.VerifyCert(ts.PublicKey, extended, now) {
+		t.Fatal("extended expiry accepted; not_after must be inside the signature")
+	}
+	if federation.VerifyCert(ts.PublicKey, cert, now.Add(25*time.Hour)) {
+		t.Fatal("expired cert accepted")
+	}
+	// A correctly signed certificate with a zero expiry is malformed, not
+	// "valid forever".
+	epoch, err := federation.SignCert(ts.PrivateKey, "a.example", server.PublicKey, time.UnixMilli(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if epoch.NotAfter != 0 {
+		t.Fatalf("test setup: NotAfter = %d, want 0", epoch.NotAfter)
+	}
+	if federation.VerifyCert(ts.PublicKey, epoch, now) {
+		t.Fatal("cert with zero expiry accepted")
 	}
 }
