@@ -19,6 +19,7 @@ The server never sees plaintext. It stores and routes ciphertext and device keys
 - [Project layout](#project-layout)
 - [Configuration](#configuration)
 - [API](#api)
+- [Security](#security)
 - [Roadmap](#roadmap)
 - [Contributing](#contributing)
 - [License](#license)
@@ -196,6 +197,10 @@ Endpoints at MVP stage:
 | `GET /v1/ws` | device |
 
 JSON over HTTPS. Protobuf is a later optimization, once the schema stops moving.
+
+## Security
+
+The protocol's metadata register lives in `api/v1/PROTOCOL.md` §17. The deployment half — adversaries, the operator-facing checklist, and the gates before public registration — is in [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md).
 
 ## Roadmap
 
