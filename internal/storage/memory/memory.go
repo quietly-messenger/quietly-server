@@ -21,10 +21,9 @@ type deviceKey struct {
 }
 
 type issuanceKey struct {
-	requesterUserID   string
-	requesterDeviceID int
-	targetUserID      string
-	targetDeviceID    int
+	targetUserID   string
+	targetDeviceID int
+	windowStart    time.Time
 }
 
 type prekeyRecord struct {
@@ -365,10 +364,10 @@ func (s *Store) CountAvailablePreKeys(_ context.Context, userID string, deviceID
 	return n, nil
 }
 
-func (s *Store) GetPreKeyIssuance(_ context.Context, requesterUserID string, requesterDeviceID int, targetUserID string, targetDeviceID int) (*storage.OneTimePreKey, time.Time, error) {
+func (s *Store) GetPreKeyIssuance(_ context.Context, targetUserID string, targetDeviceID int, windowStart time.Time) (*storage.OneTimePreKey, time.Time, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	k := issuanceKey{requesterUserID, requesterDeviceID, targetUserID, targetDeviceID}
+	k := issuanceKey{targetUserID: targetUserID, targetDeviceID: targetDeviceID, windowStart: windowStart}
 	iss, ok := s.issuances[k]
 	if !ok {
 		return nil, time.Time{}, storage.ErrNotFound
@@ -377,10 +376,10 @@ func (s *Store) GetPreKeyIssuance(_ context.Context, requesterUserID string, req
 	return &p, iss.issuedAt, nil
 }
 
-func (s *Store) RecordPreKeyIssuance(_ context.Context, requesterUserID string, requesterDeviceID int, targetUserID string, targetDeviceID int, prekey storage.OneTimePreKey) error {
+func (s *Store) RecordPreKeyIssuance(_ context.Context, targetUserID string, targetDeviceID int, windowStart time.Time, prekey storage.OneTimePreKey) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	k := issuanceKey{requesterUserID, requesterDeviceID, targetUserID, targetDeviceID}
+	k := issuanceKey{targetUserID: targetUserID, targetDeviceID: targetDeviceID, windowStart: windowStart}
 	s.issuances[k] = issuance{prekey: prekey, issuedAt: s.now()}
 	return nil
 }

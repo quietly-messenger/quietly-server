@@ -87,8 +87,11 @@ type Store interface {
 	AddOneTimePreKeys(ctx context.Context, userID string, deviceID int, prekeys []OneTimePreKey) error
 	TakeOneTimePreKey(ctx context.Context, userID string, deviceID int) (*OneTimePreKey, error)
 	CountAvailablePreKeys(ctx context.Context, userID string, deviceID int) (int, error)
-	GetPreKeyIssuance(ctx context.Context, requesterUserID string, requesterDeviceID int, targetUserID string, targetDeviceID int) (*OneTimePreKey, time.Time, error)
-	RecordPreKeyIssuance(ctx context.Context, requesterUserID string, requesterDeviceID int, targetUserID string, targetDeviceID int, prekey OneTimePreKey) error
+	// Prekey issuance idempotency is keyed per (target, window): every fetch
+	// for the same target in the same window returns the same OTPK, and the
+	// requester is never recorded (TASK-001 C, §7.2.1).
+	GetPreKeyIssuance(ctx context.Context, targetUserID string, targetDeviceID int, windowStart time.Time) (*OneTimePreKey, time.Time, error)
+	RecordPreKeyIssuance(ctx context.Context, targetUserID string, targetDeviceID int, windowStart time.Time, prekey OneTimePreKey) error
 	// PrunePreKeyIssuances deletes issuance records older than before and
 	// reports how many were removed, so the §7.2.1 idempotency table cannot
 	// grow without bound (audit F-02 residual).

@@ -66,10 +66,9 @@ func TestEndToEndAccountDeviceMessageFlow(t *testing.T) {
 		t.Fatalf("pow-params status=%d", w.Code)
 	}
 
-	// Username lookup (authenticated).
-	w = testutil.Do(h, testutil.SignedRequest(t, alice, testutil.RequestOpts{
-		Method: http.MethodGet, Path: "/v1/users/bob",
-	}))
+	// Username lookup is unauthenticated (TASK-001 C): resolving a username
+	// must not reveal who is doing the resolving.
+	w = testutil.Do(h, mustRequest(t, http.MethodGet, "/v1/users/bob", nil))
 	if w.Code != http.StatusOK {
 		t.Fatalf("lookup status=%d body=%s", w.Code, w.Body.String())
 	}
@@ -88,11 +87,11 @@ func TestEndToEndAccountDeviceMessageFlow(t *testing.T) {
 		t.Fatalf("devices=%v", got.Devices)
 	}
 
-	// Bundle fetch: consumes a prekey, then is idempotent for the same pair.
+	// Bundle fetch is unauthenticated and idempotent per (target, window), so a
+	// second fetch — even from a different client — returns the same prekey and
+	// consumes nothing (TASK-001 C).
 	bundlePath := "/v1/devices/" + bob.UserID + "/1/prekey-bundle"
-	w = testutil.Do(h, testutil.SignedRequest(t, alice, testutil.RequestOpts{
-		Method: http.MethodGet, Path: bundlePath,
-	}))
+	w = testutil.Do(h, mustRequest(t, http.MethodGet, bundlePath, nil))
 	if w.Code != http.StatusOK {
 		t.Fatalf("bundle status=%d body=%s", w.Code, w.Body.String())
 	}
@@ -100,9 +99,7 @@ func TestEndToEndAccountDeviceMessageFlow(t *testing.T) {
 	if first.OneTimePrekey == nil {
 		t.Fatal("bundle had no one-time prekey")
 	}
-	w = testutil.Do(h, testutil.SignedRequest(t, alice, testutil.RequestOpts{
-		Method: http.MethodGet, Path: bundlePath,
-	}))
+	w = testutil.Do(h, mustRequest(t, http.MethodGet, bundlePath, nil))
 	again := testutil.Decode[api.BundleResponse](t, w)
 	if again.OneTimePrekey == nil || again.OneTimePrekey.ID != first.OneTimePrekey.ID {
 		t.Fatalf("bundle fetch not idempotent: %v vs %v", again.OneTimePrekey, first.OneTimePrekey)
@@ -146,6 +143,55 @@ func TestEndToEndAccountDeviceMessageFlow(t *testing.T) {
 	}))
 	if got := testutil.Decode[api.MessagesResponse](t, w); len(got.Messages) != 0 {
 		t.Fatalf("messages after ack: %+v", got.Messages)
+	}
+}
+
+// TestFirstContactUnlinkability pins TASK-001 C: the prekey-bundle and
+// delivery-token endpoints are unauthenticated, and draining a target from many
+// distinct source addresses consumes at most one OTPK per 24 h window — so the
+// server records neither who fetched nor more than one prekey per window.
+func TestFirstContactUnlinkability(t *testing.T) {
+	limits := testutil.Limits()
+	h, store := newRouter(t, limits)
+	bob := testutil.NewAccount(t, store, limits, "bob", 1, 2, 3, 4, 5)
+
+	// Delivery-token fetch needs no authentication.
+	w := testutil.Do(h, mustRequest(t, http.MethodGet, "/v1/devices/"+bob.UserID+"/1/delivery-token", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("delivery-token status=%d body=%s", w.Code, w.Body.String())
+	}
+	if got := testutil.Decode[api.DeliveryTokenResponse](t, w); string(got.DeliveryToken) != string(bob.Token) {
+		t.Fatal("delivery-token mismatch")
+	}
+
+	// Five unauthenticated bundle fetches from five distinct addresses: all
+	// succeed, but every one returns the same prekey, so exactly one OTPK is
+	// consumed for the whole window (§7.2.1's drain bound).
+	bundlePath := "/v1/devices/" + bob.UserID + "/1/prekey-bundle"
+	var firstID uint32
+	haveFirst := false
+	remaining := -1
+	for i := 0; i < 5; i++ {
+		req := mustRequest(t, http.MethodGet, bundlePath, nil)
+		req.RemoteAddr = "203.0.113." + strconv.Itoa(i+1) + ":4444"
+		w := testutil.Do(h, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("bundle %d status=%d body=%s", i, w.Code, w.Body.String())
+		}
+		resp := testutil.Decode[api.BundleResponse](t, w)
+		if resp.OneTimePrekey == nil {
+			t.Fatal("expected a prekey")
+		}
+		if !haveFirst {
+			firstID = resp.OneTimePrekey.ID
+			haveFirst = true
+		} else if resp.OneTimePrekey.ID != firstID {
+			t.Fatalf("fetch %d got prekey %d, want %d (shared window)", i, resp.OneTimePrekey.ID, firstID)
+		}
+		remaining = resp.OneTimePrekeysRemaining
+	}
+	if remaining != 4 {
+		t.Fatalf("available prekeys = %d, want 4 (one consumed across five fetches)", remaining)
 	}
 }
 

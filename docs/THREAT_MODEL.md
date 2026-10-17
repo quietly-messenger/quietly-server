@@ -23,15 +23,17 @@ an operator must configure for the promises to hold.
 Sees TLS metadata: which client connects to which server, when, and how much
 traffic flows. Cannot read content (TLS + E2EE). A *global* passive adversary
 who watches both ends can correlate conversations — §17 documents this as
-accepted, with no cover traffic or padding in v1.
+accepted. Size padding (§16.1) and delivery jitter (§15) are partial
+mitigations; cover traffic remains a reserved gap.
 
 ### 2. Malicious or compromised home server
 
-Can read the full §17 register (who initiates conversations, per-message
-recipient/size/timing, presence, IPs), deny or delay service, drop messages,
-and serve stale prekey bundles — substitution is eventually detected by TOFU
-pinning and safety numbers (§2.0.1, §9.5), not by the crypto itself. Cannot
-read content, forge a sender (inner ratchet + sealed sender), or learn
+Can read the full §17 register (per-message recipient, quantized size, and
+timing; presence; IPs; and the source address/timing of first-contact fetches
+— but not *which* device made them, §12.6–12.8), deny or delay service, drop
+messages, and serve stale prekey bundles — substitution is eventually detected
+by TOFU pinning and safety numbers (§2.0.1, §9.5), not by the crypto itself.
+Cannot read content, forge a sender (inner ratchet + sealed sender), or learn
 anything from a push wakeup.
 
 ### 3. Database compromise (dump, no process access)
@@ -94,8 +96,9 @@ request times unless deliberately configured not to (§17).
 - [ ] Behind a reverse proxy: `TRUSTED_PROXIES` lists exactly those proxies, so
       `X-Forwarded-For` is honored only from them (without it the header is
       ignored and every request keys on the proxy's own address).
-- [ ] Per-IP throttling (`REQUESTS_PER_MINUTE`) and the bundle-fetch limiter
-      verified under load.
+- [ ] Per-IP throttling (`REQUESTS_PER_MINUTE`) and the per-address bundle-fetch
+      limiter (`BUNDLE_FETCH_PER_HOUR`) verified under load; the first-contact
+      endpoints (§12.6–12.8) are unauthenticated and must stay behind them.
 - [ ] Federation gateway reachable only as intended, with its per-peer delivery
       budget (`S2S_REQUESTS_PER_MINUTE`) sized for real peer traffic.
 - [ ] `POW_DIFFICULTY` raised above the default, plus screening a proof of

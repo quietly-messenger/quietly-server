@@ -35,16 +35,16 @@ func TestRegisterEnforcesDeviceLimit(t *testing.T) {
 // TestPreKeyBundleConsumesAndIsIdempotent covers §7.2.1 mitigation 2: a repeat
 // fetch by the same requester returns the same prekey; a different requester
 // gets a different one.
-func TestPreKeyBundleConsumesAndIsIdempotent(t *testing.T) {
+func TestPreKeyBundleIdempotentPerTargetWindow(t *testing.T) {
 	store := memory.New()
 	limits := testutil.Limits()
-	alice := testutil.NewAccount(t, store, limits, "alice", 1, 2, 3)
-	bob := testutil.NewAccount(t, store, limits, "bob")
-	carol := testutil.NewAccount(t, store, limits, "carol")
+	alice := testutil.NewAccount(t, store, limits, "alice", 1, 2, 3) // target with prekeys
+	bob := testutil.NewAccount(t, store, limits, "bob", 4, 5, 6)     // another target
 	svc := device.New(store, limits)
 	ctx := context.Background()
+	now := time.Now()
 
-	first, _, err := svc.PreKeyBundle(ctx, bob.UserID, bob.DeviceID, alice.UserID, alice.DeviceID)
+	first, _, err := svc.PreKeyBundle(ctx, alice.UserID, alice.DeviceID, now)
 	if err != nil {
 		t.Fatalf("first bundle: %v", err)
 	}
@@ -53,8 +53,10 @@ func TestPreKeyBundleConsumesAndIsIdempotent(t *testing.T) {
 	}
 	remainingAfterFirst := first.OneTimePrekeysRemaining
 
-	// Same requester, same target: identical prekey, nothing consumed.
-	again, _, err := svc.PreKeyBundle(ctx, bob.UserID, bob.DeviceID, alice.UserID, alice.DeviceID)
+	// Same target, same window: identical prekey, nothing more consumed. This
+	// is the per-(target, window) idempotency of TASK-001 C: the *requester*
+	// is not part of the key.
+	again, _, err := svc.PreKeyBundle(ctx, alice.UserID, alice.DeviceID, now)
 	if err != nil {
 		t.Fatalf("repeat bundle: %v", err)
 	}
@@ -66,35 +68,32 @@ func TestPreKeyBundleConsumesAndIsIdempotent(t *testing.T) {
 			again.OneTimePrekeysRemaining, remainingAfterFirst)
 	}
 
-	// A different requester must get a different prekey.
-	other, _, err := svc.PreKeyBundle(ctx, carol.UserID, carol.DeviceID, alice.UserID, alice.DeviceID)
+	// A different target is a different record.
+	other, _, err := svc.PreKeyBundle(ctx, bob.UserID, bob.DeviceID, now)
 	if err != nil {
 		t.Fatalf("other bundle: %v", err)
 	}
 	if other.OneTimePrekey == nil || other.OneTimePrekey.ID == first.OneTimePrekey.ID {
-		t.Fatalf("different requester reused prekey %v", other.OneTimePrekey)
+		t.Fatalf("different target reused prekey %v", other.OneTimePrekey)
 	}
 }
 
-// TestPreKeyBundleIdempotencyWindowExpires proves the window is enforced from
-// the issuance timestamp, not just per-pair forever.
-func TestPreKeyBundleIdempotencyWindowExpires(t *testing.T) {
+// TestPreKeyBundleWindowAdvances proves the idempotency window is a fixed 24 h
+// bucket: a fetch in the next window consumes a fresh OTPK (the documented
+// forward-secrecy relaxation is per-window, TASK-001 C).
+func TestPreKeyBundleWindowAdvances(t *testing.T) {
 	store := memory.New()
 	limits := testutil.Limits()
 	alice := testutil.NewAccount(t, store, limits, "alice", 1, 2, 3)
-	bob := testutil.NewAccount(t, store, limits, "bob")
 	svc := device.New(store, limits)
 	ctx := context.Background()
+	now := time.Now()
 
-	// Record the first issuance 25 hours ago.
-	store.SetNow(func() time.Time { return time.Now().Add(-25 * time.Hour) })
-	first, _, err := svc.PreKeyBundle(ctx, bob.UserID, bob.DeviceID, alice.UserID, alice.DeviceID)
+	first, _, err := svc.PreKeyBundle(ctx, alice.UserID, alice.DeviceID, now)
 	if err != nil {
 		t.Fatalf("first bundle: %v", err)
 	}
-	store.SetNow(time.Now)
-
-	second, _, err := svc.PreKeyBundle(ctx, bob.UserID, bob.DeviceID, alice.UserID, alice.DeviceID)
+	second, _, err := svc.PreKeyBundle(ctx, alice.UserID, alice.DeviceID, now.Add(24*time.Hour))
 	if err != nil {
 		t.Fatalf("second bundle: %v", err)
 	}
@@ -102,20 +101,20 @@ func TestPreKeyBundleIdempotencyWindowExpires(t *testing.T) {
 		t.Fatal("expected a prekey")
 	}
 	if second.OneTimePrekey.ID == first.OneTimePrekey.ID {
-		t.Fatalf("expired window returned the same prekey %d", first.OneTimePrekey.ID)
+		t.Fatalf("next window returned the same prekey %d", first.OneTimePrekey.ID)
 	}
 }
 
 func TestPreKeyBundleExhaustionReturnsNoPrekey(t *testing.T) {
 	store := memory.New()
 	limits := testutil.Limits()
-	alice := testutil.NewAccount(t, store, limits, "alice", 1, 2)
+	alice := testutil.NewAccount(t, store, limits, "alice", 1, 2) // two prekeys
 	svc := device.New(store, limits)
 	ctx := context.Background()
+	now := time.Now()
 
 	for i := 0; i < 2; i++ {
-		bob := testutil.NewAccount(t, store, limits, "bob"+string(rune('a'+i)))
-		resp, _, err := svc.PreKeyBundle(ctx, bob.UserID, bob.DeviceID, alice.UserID, alice.DeviceID)
+		resp, _, err := svc.PreKeyBundle(ctx, alice.UserID, alice.DeviceID, now.Add(time.Duration(i)*24*time.Hour))
 		if err != nil {
 			t.Fatalf("bundle %d: %v", i, err)
 		}
@@ -123,9 +122,9 @@ func TestPreKeyBundleExhaustionReturnsNoPrekey(t *testing.T) {
 			t.Fatalf("bundle %d: expected prekey", i)
 		}
 	}
-	// Exhausted: one_time_prekey is null and that is not an error (§7.2).
-	bob := testutil.NewAccount(t, store, limits, "gone")
-	resp, _, err := svc.PreKeyBundle(ctx, bob.UserID, bob.DeviceID, alice.UserID, alice.DeviceID)
+	// A third window is exhausted: one_time_prekey is null and that is not an
+	// error (§7.2).
+	resp, _, err := svc.PreKeyBundle(ctx, alice.UserID, alice.DeviceID, now.Add(48*time.Hour))
 	if err != nil {
 		t.Fatalf("exhausted bundle: %v", err)
 	}
@@ -198,7 +197,6 @@ func TestUpdateSignedPreKeyVerifiesSignatureAndReportsRotation(t *testing.T) {
 	store := memory.New()
 	limits := testutil.Limits()
 	alice := testutil.NewAccount(t, store, limits, "alice")
-	bob := testutil.NewAccount(t, store, limits, "bob")
 	svc := device.New(store, limits)
 	ctx := context.Background()
 
@@ -232,7 +230,7 @@ func TestUpdateSignedPreKeyVerifiesSignatureAndReportsRotation(t *testing.T) {
 		t.Fatalf("update: %v", err)
 	}
 
-	resp, rotatedAt, err := svc.PreKeyBundle(ctx, bob.UserID, bob.DeviceID, alice.UserID, alice.DeviceID)
+	resp, rotatedAt, err := svc.PreKeyBundle(ctx, alice.UserID, alice.DeviceID, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}

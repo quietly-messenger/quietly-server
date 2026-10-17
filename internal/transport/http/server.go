@@ -81,9 +81,6 @@ func (s *Server) Router(store auth.DeviceStore, authSkew time.Duration, nonces *
 			r.Post("/devices", s.registerDevice)
 			r.Get("/devices", s.listDevices)
 			r.Delete("/devices/{device_id}", s.revokeDevice)
-			r.Get("/users/{username}", s.lookupUser)
-			r.Get("/devices/{user_id}/{device_id}/prekey-bundle", s.preKeyBundle)
-			r.Get("/devices/{user_id}/{device_id}/delivery-token", s.deliveryToken)
 			r.Post("/devices/{device_id}/prekeys", s.addPreKeys)
 			r.Put("/devices/{device_id}/signed-prekey", s.updateSignedPreKey)
 			r.Put("/devices/{device_id}/delivery-token", s.updateDeliveryToken)
@@ -92,6 +89,13 @@ func (s *Server) Router(store auth.DeviceStore, authSkew time.Duration, nonces *
 			r.Post("/messages/{id}/ack", s.ackMessage)
 			r.Get("/ws", s.websocket)
 		})
+
+		// First-contact endpoints are unauthenticated (TASK-001 C): the server
+		// must not learn who is starting a conversation with whom. They are
+		// still behind the per-IP limiter.
+		r.Get("/users/{username}", s.lookupUser)
+		r.Get("/devices/{user_id}/{device_id}/prekey-bundle", s.preKeyBundle)
+		r.Get("/devices/{user_id}/{device_id}/delivery-token", s.deliveryToken)
 
 		// Message submission is unauthenticated; gated by delivery token.
 		r.Post("/messages", s.submitMessage)
@@ -224,8 +228,7 @@ func (s *Server) lookupUser(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) preKeyBundle(w http.ResponseWriter, r *http.Request) {
-	dev := auth.DeviceFrom(r.Context())
-	if !s.bundleLimiter.Allow("bundle:" + dev.UserID + ":" + strconv.Itoa(dev.ID)) {
+	if !s.bundleLimiter.Allow("bundle:" + s.clientIP(r)) {
 		w.Header().Set("Retry-After", "3600")
 		api.WriteError(w, api.Errorf(api.CodeRateLimited, "bundle fetch limit reached"))
 		return
@@ -235,7 +238,7 @@ func (s *Server) preKeyBundle(w http.ResponseWriter, r *http.Request) {
 		api.WriteError(w, err)
 		return
 	}
-	resp, spkRotatedAt, err := s.devices.PreKeyBundle(r.Context(), dev.UserID, dev.ID, chi.URLParam(r, "user_id"), deviceID)
+	resp, spkRotatedAt, err := s.devices.PreKeyBundle(r.Context(), chi.URLParam(r, "user_id"), deviceID, time.Now())
 	if err != nil {
 		api.WriteError(w, err)
 		return

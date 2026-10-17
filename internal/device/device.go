@@ -151,11 +151,12 @@ func (s *Service) Revoke(ctx context.Context, userID string, deviceID int) error
 const OTPIdempotencyWindow = 24 * time.Hour
 
 // PreKeyBundle returns the recipient's bundle, consuming one one-time prekey
-// (§7.2, §12.7). Repeat fetches by the same requester within the idempotency
-// window return the same prekey (§7.2.1 mitigation 2). It also reports when the
-// target's signed prekey was installed so the caller can nudge the device when
-// rotation is due (§7.2.1 mitigation 4, audit F-02).
-func (s *Service) PreKeyBundle(ctx context.Context, requesterUserID string, requesterDeviceID int, targetUserID string, targetDeviceID int) (*api.BundleResponse, time.Time, error) {
+// (§7.2, §12.7). The request is unauthenticated, so idempotency is keyed per
+// (target, 24 h window): every fetch for the same target in the same window
+// returns the same prekey, and the requester is never recorded (TASK-001 C,
+// §7.2.1). It also reports when the target's signed prekey was installed so
+// the caller can nudge the device when rotation is due (§7.2.1 mitigation 4).
+func (s *Service) PreKeyBundle(ctx context.Context, targetUserID string, targetDeviceID int, now time.Time) (*api.BundleResponse, time.Time, error) {
 	d, err := s.store.GetDevice(ctx, targetUserID, targetDeviceID)
 	if err != nil {
 		if err == storage.ErrNotFound {
@@ -167,8 +168,9 @@ func (s *Service) PreKeyBundle(ctx context.Context, requesterUserID string, requ
 		return nil, time.Time{}, api.Errorf(api.CodeDeviceRevoked, "device revoked")
 	}
 
+	windowStart := now.Truncate(OTPIdempotencyWindow)
 	var otpk *storage.OneTimePreKey
-	if prev, at, err := s.store.GetPreKeyIssuance(ctx, requesterUserID, requesterDeviceID, targetUserID, targetDeviceID); err == nil && time.Since(at) < OTPIdempotencyWindow {
+	if prev, _, err := s.store.GetPreKeyIssuance(ctx, targetUserID, targetDeviceID, windowStart); err == nil {
 		otpk = prev
 	} else {
 		otpk, err = s.store.TakeOneTimePreKey(ctx, targetUserID, targetDeviceID)
@@ -176,7 +178,7 @@ func (s *Service) PreKeyBundle(ctx context.Context, requesterUserID string, requ
 			return nil, time.Time{}, api.Errorf(api.CodeInternalError, "prekey fetch failed")
 		}
 		if otpk != nil {
-			if err := s.store.RecordPreKeyIssuance(ctx, requesterUserID, requesterDeviceID, targetUserID, targetDeviceID, *otpk); err != nil {
+			if err := s.store.RecordPreKeyIssuance(ctx, targetUserID, targetDeviceID, windowStart, *otpk); err != nil {
 				return nil, time.Time{}, api.Errorf(api.CodeInternalError, "prekey issuance failed")
 			}
 		}

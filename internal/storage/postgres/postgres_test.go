@@ -351,14 +351,14 @@ func TestTakeOneTimePreKeyConcurrent(t *testing.T) {
 func TestPreKeyIssuanceRoundTrip(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()
-	req, _ := mustAccount(t, st, "frank")
 	target, _ := mustAccount(t, st, "gina")
 
+	w := time.Now().UTC().Truncate(24 * time.Hour)
 	first := storage.OneTimePreKey{ID: 7, PublicKey: rb(t, 32)}
-	if err := st.RecordPreKeyIssuance(ctx, req.ID, 1, target.ID, 1, first); err != nil {
+	if err := st.RecordPreKeyIssuance(ctx, target.ID, 1, w, first); err != nil {
 		t.Fatalf("record: %v", err)
 	}
-	got, at, err := st.GetPreKeyIssuance(ctx, req.ID, 1, target.ID, 1)
+	got, at, err := st.GetPreKeyIssuance(ctx, target.ID, 1, w)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -371,10 +371,10 @@ func TestPreKeyIssuanceRoundTrip(t *testing.T) {
 
 	second := storage.OneTimePreKey{ID: 8, PublicKey: rb(t, 32)}
 	time.Sleep(10 * time.Millisecond) // make issued_at observably newer
-	if err := st.RecordPreKeyIssuance(ctx, req.ID, 1, target.ID, 1, second); err != nil {
+	if err := st.RecordPreKeyIssuance(ctx, target.ID, 1, w, second); err != nil {
 		t.Fatalf("re-record: %v", err)
 	}
-	got, at2, err := st.GetPreKeyIssuance(ctx, req.ID, 1, target.ID, 1)
+	got, at2, err := st.GetPreKeyIssuance(ctx, target.ID, 1, w)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -385,9 +385,9 @@ func TestPreKeyIssuanceRoundTrip(t *testing.T) {
 		t.Fatalf("issued_at did not advance on re-record: %v then %v", at, at2)
 	}
 
-	// The reverse direction is a different pair and must not appear.
-	if _, _, err := st.GetPreKeyIssuance(ctx, target.ID, 1, req.ID, 1); !errors.Is(err, storage.ErrNotFound) {
-		t.Fatalf("reverse pair error = %v, want ErrNotFound", err)
+	// A different window for the same target is a different record.
+	if _, _, err := st.GetPreKeyIssuance(ctx, target.ID, 1, w.Add(24*time.Hour)); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("other window error = %v, want ErrNotFound", err)
 	}
 }
 
@@ -397,16 +397,16 @@ func TestPreKeyIssuanceRoundTrip(t *testing.T) {
 func TestPrunePreKeyIssuances(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()
-	req, _ := mustAccount(t, st, "iris")
 	old, _ := mustAccount(t, st, "jack")
 	fresh, _ := mustAccount(t, st, "kate")
 
+	w := time.Now().UTC().Truncate(24 * time.Hour)
 	oldKey := storage.OneTimePreKey{ID: 1, PublicKey: rb(t, 32)}
 	freshKey := storage.OneTimePreKey{ID: 2, PublicKey: rb(t, 32)}
-	if err := st.RecordPreKeyIssuance(ctx, req.ID, 1, old.ID, 1, oldKey); err != nil {
+	if err := st.RecordPreKeyIssuance(ctx, old.ID, 1, w, oldKey); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.RecordPreKeyIssuance(ctx, req.ID, 1, fresh.ID, 1, freshKey); err != nil {
+	if err := st.RecordPreKeyIssuance(ctx, fresh.ID, 1, w, freshKey); err != nil {
 		t.Fatal(err)
 	}
 
@@ -424,10 +424,10 @@ func TestPrunePreKeyIssuances(t *testing.T) {
 	if n != 1 {
 		t.Fatalf("pruned %d rows, want 1", n)
 	}
-	if _, _, err := st.GetPreKeyIssuance(ctx, req.ID, 1, old.ID, 1); !errors.Is(err, storage.ErrNotFound) {
+	if _, _, err := st.GetPreKeyIssuance(ctx, old.ID, 1, w); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("expired issuance error = %v, want ErrNotFound", err)
 	}
-	got, _, err := st.GetPreKeyIssuance(ctx, req.ID, 1, fresh.ID, 1)
+	got, _, err := st.GetPreKeyIssuance(ctx, fresh.ID, 1, w)
 	if err != nil {
 		t.Fatalf("fresh issuance: %v", err)
 	}

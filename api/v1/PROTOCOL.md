@@ -340,8 +340,10 @@ This is a real loss, and it must be stated precisely. The Double Ratchet's forwa
 
 Four mandatory mitigations:
 
-1. **Per-requester rate limit** on bundle fetch (`bundle_fetch_per_hour`). Bundle fetch is authenticated, so the server always knows who is draining and can act.
-2. **Per-pair idempotency.** Repeat fetches by the same requester for the same target device within `otp_idempotency_window_h` return the **same** one-time prekey rather than consuming another. A session needs exactly one bundle; retries, reinstalls, and rotations must not cost key material.
+1. **Per-IP rate limit** on bundle fetch (`bundle_fetch_per_hour`, keyed on source address now that bundle fetch is unauthenticated — §12.7, TASK-001 C). Behind an OHTTP-style relay every client shares an address, so this degrades to a per-relay budget; the anti-drain guarantee is carried by mitigation 2, not this one.
+2. **Per-(target, window) idempotency.** Bundle fetch records no requester. Repeat fetches for the same target device within a fixed `otp_idempotency_window_h` bucket return the **same** one-time prekey rather than consuming another, so a session needs exactly one bundle and retries, reinstalls, and rotations must not cost key material. This bounds the drain to **one OTPK per target per window** regardless of how many distinct clients fetch (two fetches straddling a bucket boundary may consume two).
+
+   The cost is a documented forward-secrecy relaxation of the **initial** secret: every session established against the same target inside one window uses the same one-time prekey, so an adversary who later compromises the target's `identity_key_dh` and that window's one-time-prekey private half can reconstruct all of them. Established-session forward secrecy is unaffected, and the exposure is bounded by `spk_rotation_days` like any prekey-based establishment.
 3. **Low-prekey signalling.** When a device's count falls below `otp_replenish_threshold`, the server pushes a `prekeys_low` frame (§13.2) to that device if connected. Replenishment must not wait for the next app launch.
 4. **Short signed prekey lifetime.** `spk_rotation_days` is 3, bounding the window in which an exhausted device is exposed.
 
@@ -705,7 +707,7 @@ Response `204`.
 
 ### 12.6 `GET /v1/users/{username}`
 
-Authenticated. Resolves a username to its routing identity and active devices.
+Unauthenticated (TASK-001 C). Resolves a username to its routing identity and active devices.
 
 ```json
 { "v": "quietly/1", "user_id": "7c9e6679-...", "username": "bob", "devices": [ 1, 3 ] }
@@ -715,13 +717,13 @@ Errors: `user_not_found`. The response for a nonexistent username is byte-identi
 
 ### 12.7 `GET /v1/devices/{user_id}/{device_id}/prekey-bundle`
 
-Authenticated. Returns §7.2 and consumes one one-time prekey.
+Unauthenticated (TASK-001 C). Returns §7.2 and consumes at most one one-time prekey per window (§7.2.1). The requester is never recorded, so the server cannot link an initiator to a target.
 
 Errors: `user_not_found`, `device_unknown`, `device_revoked`, `rate_limited`.
 
 ### 12.8 `GET /v1/devices/{user_id}/{device_id}/delivery-token`
 
-Authenticated. Returns only the recipient device's current delivery token. **Consumes no one-time prekey** (§6, §7.2.1).
+Unauthenticated (TASK-001 C). Returns only the recipient device's current delivery token. **Consumes no one-time prekey** (§6, §7.2.1).
 
 ```json
 { "v": "quietly/1", "user_id": "7c9e6679-...", "device_id": 1, "delivery_token": "u4Kd9Xp2..." }
@@ -776,7 +778,7 @@ This endpoint is unauthenticated, so distinguishing those cases would hand any a
 - return the identical body and status for every recipient-state failure
 - avoid distinguishable fast paths where practical: the implementation performs the same token comparison for an existing device and a missing one, but internal work still differs (a database hit versus a miss), so timing MUST be treated as non-authoritative rather than claimed constant. `user_id` secrecy is what raises the cost of enumeration.
 
-A client receiving `delivery_rejected` refetches the delivery token (§12.8), and if that also fails, refetches the bundle (§12.7). Both are authenticated, so they may return a precise cause without creating an oracle.
+A client receiving `delivery_rejected` refetches the delivery token (§12.8), and if that also fails, refetches the bundle (§12.7). Both are unauthenticated, so they may return a precise cause to the caller — but only for a device the caller already names by `user_id`/`device_id`; this trades a device-state oracle against the unguessability of `user_id` (documented in §17), not against a per-request token.
 
 ### 12.14 `GET /v1/messages`
 
@@ -909,8 +911,8 @@ Error responses MUST NOT leak whether a username exists beyond what `user_not_fo
 | `pow_window_ms` | ±300 000 | solving takes time |
 | `spk_rotation_days` | 3 | signed prekey rotation; short to bound §7.2.1 exposure |
 | `spk_grace_days` | 3 | previous signed prekey stays valid |
-| `bundle_fetch_per_hour` | 60 | per requesting device, across all targets |
-| `otp_idempotency_window_h` | 24 | repeat fetch by the same requester for the same target returns the same prekey |
+| `bundle_fetch_per_hour` | 60 | per source address (bundle fetch is unauthenticated — §12.7); behind a relay, per relay |
+| `otp_idempotency_window_h` | 24 | one OTPK per target per fixed window, shared by every fetch in it (§7.2.1, TASK-001 C) |
 | `sealed_nonce_bytes` | 24 | XChaCha20-Poly1305, random per message |
 | `max_skip_per_chain` | 1 000 | client-side ratchet limit |
 | `max_skipped_chains` | 5 | client-side ratchet limit |
@@ -932,6 +934,7 @@ Reserved now so that adding them is not a breaking change:
 - **Sender certificates** (§10.4) — would add a signed sender assertion inside the sealed payload.
 - **Server-issued PoW challenges** (§4) — a short-lived challenge nonce binding each solve to a recent issuance, closing the stockpiling window.
 - **Traffic shaping** (§16.1) — size padding is specified; cover traffic remains reserved.
+- **Anonymous access tokens** (§17, TASK-001 C follow-up) — Privacy-Pass / VOPRF-style blinded tokens so the unauthenticated first-contact endpoints (§12.6–12.8) can keep a per-account budget without linking the token to the device. Reserved, not implemented.
 - **Federation** — `user_id` is globally unique as a UUID, so a future `domain` field on the envelope routes cross-server without changing identity.
 - **Protobuf** — the JSON shapes here map one-to-one; the binary layouts (§9, §10) are already final and would be unaffected.
 
@@ -991,7 +994,7 @@ Stated plainly, because a protocol that pretends to leak nothing is worse than o
 
 The server **can** observe:
 
-- Which device fetched a prekey bundle for which device, and when. **This reveals who is starting a conversation with whom**, at session start. Sealed sender hides the sender of every subsequent message but not this first act.
+- The source address and timing of username lookups, prekey-bundle fetches, and delivery-token fetches — but **not** which account or device made them: those endpoints are unauthenticated and the requester is never recorded (§12.6–12.8, TASK-001 C). A fetch followed by an anonymous `POST /v1/messages` is still correlatable by source address alone, which is why §16 reserves stronger protection.
 - The recipient of every message, its quantized size (one of the five §16.1 padding buckets), and its timing. Traffic analysis over recipient and timing is the primary residual attack; message size is no longer a continuous signal.
 - Which devices are connected by WebSocket, and when — an online-presence signal, even though presence is never exposed via the API.
 - The IP address of every request, including unauthenticated submissions.
@@ -999,6 +1002,7 @@ The server **can** observe:
 
 The server **cannot** observe:
 
+- Who fetched a prekey bundle or delivery token for a target device — the requester is not recorded and the endpoints are unauthenticated (§12.7, TASK-001 C). The first-contact "who starts a conversation with whom" signal is gone at the protocol level.
 - Message content, or anything derived from it.
 - The sender of any message (§10).
 - Whether a message is 1:1 or group, once groups exist (§10.2).
@@ -1023,3 +1027,6 @@ Stated so they are decisions rather than oversights:
 | Initial vs normal messages differ by ~104 B of overhead (§16.1) | Accepted: padding quantizes to the bucket set but does not merge the two message families. |
 | Size padding adds ~4 KiB worst-case for messages near the top of a bucket (§16.1) | Accepted as the cost of removing the length signal; buckets are configurable client-side. |
 | Delivery jitter is partial (§15) | Accepted: a randomized server-side hold weakens but does not break timing correlation. Cover traffic is a separate, later task. |
+| One OTPK per target per window (§7.2.1) | Accepted: a per-window forward-secrecy relaxation of the initial secret, chosen to bound the drain on unauthenticated fetch. Revisited with §16 anonymous tokens. |
+| Unauthenticated fetches expose device existence/revocation by `user_id` (§12.7, §12.8) | Accepted: `user_id` is a random UUID, so enumeration is not free; the precise-cause responses are a deliberate part of C2. |
+| First-contact correlation by source address remains (§17) | Accepted for C2: identity linkage is gone, address+timing linkage is not. §16 reserves relays/tokens for it. |

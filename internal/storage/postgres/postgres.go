@@ -360,14 +360,13 @@ func (s *Store) CountAvailablePreKeys(ctx context.Context, userID string, device
 	return n, err
 }
 
-func (s *Store) GetPreKeyIssuance(ctx context.Context, requesterUserID string, requesterDeviceID int, targetUserID string, targetDeviceID int) (*storage.OneTimePreKey, time.Time, error) {
+func (s *Store) GetPreKeyIssuance(ctx context.Context, targetUserID string, targetDeviceID int, windowStart time.Time) (*storage.OneTimePreKey, time.Time, error) {
 	var p storage.OneTimePreKey
 	var at time.Time
 	err := s.pool.QueryRow(ctx,
 		`SELECT prekey_id, public_key, issued_at FROM prekey_issuances
-		 WHERE requester_user_id = $1 AND requester_device_id = $2
-		   AND target_user_id = $3 AND target_device_id = $4`,
-		requesterUserID, requesterDeviceID, targetUserID, targetDeviceID,
+		 WHERE target_user_id = $1 AND target_device_id = $2 AND window_start = $3`,
+		targetUserID, targetDeviceID, windowStart,
 	).Scan(&p.ID, &p.PublicKey, &at)
 	if err != nil {
 		return nil, time.Time{}, mapErr(err)
@@ -375,14 +374,14 @@ func (s *Store) GetPreKeyIssuance(ctx context.Context, requesterUserID string, r
 	return &p, at, nil
 }
 
-func (s *Store) RecordPreKeyIssuance(ctx context.Context, requesterUserID string, requesterDeviceID int, targetUserID string, targetDeviceID int, prekey storage.OneTimePreKey) error {
+func (s *Store) RecordPreKeyIssuance(ctx context.Context, targetUserID string, targetDeviceID int, windowStart time.Time, prekey storage.OneTimePreKey) error {
 	_, err := s.pool.Exec(ctx,
 		`INSERT INTO prekey_issuances
-		   (requester_user_id, requester_device_id, target_user_id, target_device_id, prekey_id, public_key)
-		 VALUES ($1, $2, $3, $4, $5, $6)
-		 ON CONFLICT (requester_user_id, requester_device_id, target_user_id, target_device_id)
+		   (target_user_id, target_device_id, window_start, prekey_id, public_key)
+		 VALUES ($1, $2, $3, $4, $5)
+		 ON CONFLICT (target_user_id, target_device_id, window_start)
 		 DO UPDATE SET prekey_id = EXCLUDED.prekey_id, public_key = EXCLUDED.public_key, issued_at = now()`,
-		requesterUserID, requesterDeviceID, targetUserID, targetDeviceID, prekey.ID, prekey.PublicKey,
+		targetUserID, targetDeviceID, windowStart, prekey.ID, prekey.PublicKey,
 	)
 	return err
 }
