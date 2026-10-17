@@ -21,6 +21,7 @@ import (
 	"github.com/quietly-messenger/quietly-server/internal/storage"
 	"github.com/quietly-messenger/quietly-server/internal/storage/postgres"
 	transporthttp "github.com/quietly-messenger/quietly-server/internal/transport/http"
+	"github.com/quietly-messenger/quietly-server/internal/transport/tlsconfig"
 	"github.com/quietly-messenger/quietly-server/internal/transport/ws"
 )
 
@@ -69,6 +70,11 @@ func main() {
 	handler := srv.Router(store, time.Duration(limits.AuthSkewMs)*time.Millisecond, nonces)
 
 	addr := netAddr(cfg)
+	tlsCfg, err := tlsconfig.FromEnv()
+	if err != nil {
+		slog.Error("tls", "error", err)
+		os.Exit(1)
+	}
 	// Timeouts bound slowloris and idle-body attacks (audit F-12). The
 	// WebSocket handler manages its own per-frame deadlines after hijacking
 	// the connection.
@@ -79,13 +85,20 @@ func main() {
 		ReadTimeout:       30 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    32 << 10,
+		TLSConfig:         tlsCfg,
 	}
 
 	go ttlCleanup(ctx, store, time.Hour)
 
 	go func() {
-		slog.Info("listening", "addr", addr)
-		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		slog.Info("listening", "addr", addr, "tls", tlsCfg != nil)
+		if tlsCfg != nil {
+			err = httpServer.ListenAndServeTLS("", "")
+		} else {
+			slog.Warn("TLS not configured; PROTOCOL.md §1 requires HTTPS — set TLS_CERT_FILE/TLS_KEY_FILE or run behind a TLS terminator")
+			err = httpServer.ListenAndServe()
+		}
+		if err != nil && err != http.ErrServerClosed {
 			slog.Error("http", "error", err)
 			stop()
 		}

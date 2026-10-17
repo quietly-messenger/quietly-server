@@ -12,6 +12,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/quietly-messenger/quietly-crypto/cryptocore"
 )
@@ -131,15 +132,36 @@ type DeliveryRequest struct {
 	Request SignedRequest `json:"request"`
 }
 
+// MaxClockSkew bounds how far a delivery timestamp may be from local time. It
+// complements the nonce replay check: a captured delivery stays replayable
+// forever without both (audit F-03).
+const MaxClockSkew = 5 * time.Minute
+
 // VerifyDelivery checks that the certificate is valid (against the trust
-// service public key) and not revoked, and that the request signature verifies
-// against the certificate's public key.
-func VerifyDelivery(tsPub []byte, revoked func(domain string) bool, d DeliveryRequest) bool {
+// service public key) and not revoked, that the request comes from the
+// certified domain, that its timestamp is fresh, that its signature verifies
+// against the certificate's public key, and — when replay is non-nil — that its
+// nonce has not been seen. replay(domain, nonce) must return true only on the
+// first sighting of a nonce.
+func VerifyDelivery(tsPub []byte, revoked func(domain string) bool, replay func(domain, nonce string) bool, now time.Time, d DeliveryRequest) bool {
 	if !VerifyCert(tsPub, d.Cert) {
 		return false
 	}
 	if revoked != nil && revoked(d.Cert.Domain) {
 		return false
 	}
-	return d.Request.Verify(d.Cert.PublicKey)
+	if d.Request.Domain != d.Cert.Domain {
+		return false
+	}
+	ts := time.UnixMilli(d.Request.Timestamp)
+	if skew := now.Sub(ts); skew > MaxClockSkew || -skew > MaxClockSkew {
+		return false
+	}
+	if !d.Request.Verify(d.Cert.PublicKey) {
+		return false
+	}
+	if replay != nil && !replay(d.Cert.Domain, d.Request.Nonce) {
+		return false
+	}
+	return true
 }

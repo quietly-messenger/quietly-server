@@ -4,7 +4,11 @@
 package trust
 
 import (
+	"encoding/json"
+	"errors"
+	"os"
 	"sync"
+	"time"
 
 	"github.com/quietly-messenger/quietly-server/internal/federation"
 )
@@ -60,8 +64,8 @@ func (ca *CA) IsRevoked(domain string) bool {
 }
 
 // VerifyDelivery verifies an S2S delivery request against this CA.
-func (ca *CA) VerifyDelivery(d federation.DeliveryRequest) bool {
-	return federation.VerifyDelivery(ca.tsPub, ca.IsRevoked, d)
+func (ca *CA) VerifyDelivery(d federation.DeliveryRequest, replay func(domain, nonce string) bool, now time.Time) bool {
+	return federation.VerifyDelivery(ca.tsPub, ca.IsRevoked, replay, now, d)
 }
 
 // Certs returns a snapshot of issued certificates with their revocation state.
@@ -73,4 +77,51 @@ func (ca *CA) Certs() map[string]bool {
 		out[d] = ca.revoked[d]
 	}
 	return out
+}
+
+// state is the on-disk form of the CA registry.
+type state struct {
+	Certs   map[string]federation.ServerCert `json:"certs"`
+	Revoked map[string]bool                  `json:"revoked"`
+}
+
+// Load restores issued certificates and revocations from path. A missing file
+// leaves the CA empty (first boot).
+func (ca *CA) Load(path string) error {
+	b, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var s state
+	if err := json.Unmarshal(b, &s); err != nil {
+		return err
+	}
+	ca.mu.Lock()
+	defer ca.mu.Unlock()
+	if s.Certs != nil {
+		ca.certs = s.Certs
+	}
+	if s.Revoked != nil {
+		ca.revoked = s.Revoked
+	}
+	return nil
+}
+
+// Save writes the CA registry to path atomically, so a restart cannot lose
+// issued certificates or revocations (audit F-03).
+func (ca *CA) Save(path string) error {
+	ca.mu.Lock()
+	b, err := json.MarshalIndent(state{Certs: ca.certs, Revoked: ca.revoked}, "", "  ")
+	ca.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }

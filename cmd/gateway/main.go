@@ -1,24 +1,72 @@
 // Command gateway is the Federation Gateway: it receives signed server-to-server
 // delivery requests, verifies them against the trust service, and enqueues the
 // message locally (docs/FEDERATION.md).
+//
+// Deliveries are verified for certificate validity, revocation, timestamp
+// freshness, signature, and nonce replay (audit F-03), and revocation state is
+// polled live from the trust service.
 package main
 
 import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/quietly-messenger/quietly-server/internal/auth"
 	"github.com/quietly-messenger/quietly-server/internal/federation"
 	"github.com/quietly-messenger/quietly-server/internal/storage"
 	"github.com/quietly-messenger/quietly-server/internal/storage/postgres"
-	"github.com/quietly-messenger/quietly-server/internal/trust"
+	"github.com/quietly-messenger/quietly-server/internal/transport/tlsconfig"
 )
+
+const (
+	maxBodyBytes   = 256 << 10
+	revocationPoll = 30 * time.Second
+)
+
+// revocationCache holds the trust service's revocation view.
+type revocationCache struct {
+	mu      sync.RWMutex
+	revoked map[string]bool
+}
+
+func (rc *revocationCache) isRevoked(domain string) bool {
+	rc.mu.RLock()
+	defer rc.mu.RUnlock()
+	return rc.revoked[domain]
+}
+
+// refresh fetches GET /servers from the trust service and replaces the cache.
+func (rc *revocationCache) refresh(client *http.Client, base string) error {
+	u := strings.TrimRight(base, "/") + "/servers"
+	resp, err := client.Get(u)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return errors.New("trust service returned " + resp.Status)
+	}
+	var body struct {
+		Servers map[string]bool `json:"servers"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return err
+	}
+	rc.mu.Lock()
+	rc.revoked = body.Servers
+	rc.mu.Unlock()
+	return nil
+}
 
 func main() {
 	ctx := context.Background()
@@ -27,6 +75,10 @@ func main() {
 	if err != nil || len(tsPub) == 0 {
 		slog.Error("TRUST_PUBLIC_KEY required")
 		os.Exit(1)
+	}
+	trustURL := os.Getenv("TRUST_URL")
+	if trustURL == "" {
+		trustURL = "http://trust:8081"
 	}
 
 	pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
@@ -37,24 +89,52 @@ func main() {
 	defer pool.Close()
 
 	store := postgres.New(pool)
-	ca := trust.New(nil, tsPub) // CA with a public key only, for verification
+	revoked := &revocationCache{}
+	trustClient := &http.Client{Timeout: 10 * time.Second}
+	// Fail closed at boot: without the revocation view, deliveries must not be
+	// accepted (audit F-03).
+	if err := revoked.refresh(trustClient, trustURL); err != nil {
+		slog.Error("fetch revocation list", "url", trustURL, "error", err)
+		os.Exit(1)
+	}
+	go func() {
+		t := time.NewTicker(revocationPoll)
+		defer t.Stop()
+		for range t.C {
+			if err := revoked.refresh(trustClient, trustURL); err != nil {
+				slog.Warn("revocation refresh failed", "error", err)
+			}
+		}
+	}()
 
-	http.HandleFunc("/deliver", func(w http.ResponseWriter, r *http.Request) {
+	nonces := auth.NewNonceCache(2 * federation.MaxClockSkew)
+	replay := func(domain, nonce string) bool {
+		return nonces.CheckAndAdd(domain+"\x00"+nonce, time.Now())
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/deliver", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 		var d federation.DeliveryRequest
 		if err := json.NewDecoder(r.Body).Decode(&d); err != nil {
 			http.Error(w, "invalid request", http.StatusBadRequest)
 			return
 		}
-		if !ca.VerifyDelivery(d) {
+		if !federation.VerifyDelivery(tsPub, revoked.isRevoked, replay, time.Now(), d) {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
+		now := time.Now()
 		m := &storage.Message{
 			RecipientUserID:   d.Request.Recipient.UserID,
 			RecipientDeviceID: d.Request.Recipient.DeviceID,
 			Sealed:            d.Request.Sealed,
-			ServerTS:          time.Now(),
-			TTLExpiresAt:      time.Now().Add(30 * 24 * time.Hour),
+			ServerTS:          now,
+			TTLExpiresAt:      now.Add(30 * 24 * time.Hour),
 		}
 		if err := store.EnqueueMessage(r.Context(), m); err != nil {
 			slog.Error("enqueue", "error", err)
@@ -68,8 +148,28 @@ func main() {
 	if addr == "" {
 		addr = "0.0.0.0:8082"
 	}
-	slog.Info("gateway listening", "addr", addr)
-	if err := http.ListenAndServe(addr, nil); err != nil {
+	tlsCfg, err := tlsconfig.FromEnv()
+	if err != nil {
+		slog.Error("tls", "error", err)
+		os.Exit(1)
+	}
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    32 << 10,
+		TLSConfig:         tlsCfg,
+	}
+	slog.Info("gateway listening", "addr", addr, "tls", tlsCfg != nil, "trust", trustURL)
+	if tlsCfg != nil {
+		err = srv.ListenAndServeTLS("", "")
+	} else {
+		slog.Warn("TLS not configured; federation links must terminate TLS in front of the gateway")
+		err = srv.ListenAndServe()
+	}
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
 		slog.Error("gateway", "error", err)
 		os.Exit(1)
 	}

@@ -69,8 +69,10 @@ cp .env.example .env   # DATABASE_URL already points at the `postgres` service
 docker compose up --build
 ```
 
-This runs migrations and starts `server` on `:8080`, `trust` on `:8081`, and
-`gateway` on `:8082`.
+This runs migrations and starts `server` on `:8080`. The trust service (`:8081`)
+is internal to the Compose network, and the gateway (`:8082`) is bound to
+localhost: terminate TLS in front before exposing either to peers. Set
+`TRUST_ADMIN_TOKEN` in `.env` before starting.
 
 ### Run locally (without Docker)
 
@@ -128,10 +130,14 @@ internal/
   api/              JSON wire types + error model
   id/               UUIDv4 + monotonic ULID generation
   storage/          Store interface + postgres implementation
+  storage/memory/   in-memory Store for tests and local runs
+  ratelimit/        bounded token-bucket limiter (per-IP, bundle fetch)
   transport/http/   handlers, routes
   transport/ws/     WebSocket hub
-  federation/       S2S types + cert/signature verification
-  trust/            certificate authority
+  transport/tlsconfig/ TLS 1.3 configuration shared by the binaries
+  federation/       S2S types + cert/signature/replay verification
+  trust/            certificate authority with persisted state
+  testutil/         signed-request and fixture helpers (tests only)
   config/           env-based configuration
 migrations/         SQL schema migrations
 docs/FEDERATION.md  federation design (first cut)
@@ -149,6 +155,15 @@ The server is configured entirely through environment variables. See `.env.examp
 | `DATABASE_URL` | Postgres connection string | — |
 | `MESSAGE_TTL_DAYS` | offline message expiry | `30` |
 | `LOG_LEVEL` | `debug`/`info`/`warn`/`error` | `info` |
+| `TLS_CERT_FILE` / `TLS_KEY_FILE` | terminate TLS 1.3 in-process (or leave unset behind a TLS proxy) | — |
+| `BUNDLE_FETCH_PER_HOUR` | per-requesting-device prekey-bundle limit | `60` |
+| `REQUESTS_PER_MINUTE` | per-IP request limit for the HTTP surface | `120` |
+| `WS_PING_INTERVAL_S` / `WS_IDLE_TIMEOUT_S` | WebSocket keepalive / idle close | `30` / `90` |
+| `WS_ALLOWED_ORIGINS` | browser origins allowed on `/v1/ws` (native clients unaffected) | empty |
+
+The trust service additionally uses `TRUST_ADMIN_TOKEN` (required — admin bearer token for issuing/revoking certificates), `TRUST_PRIVATE_KEY`, `TRUST_STATE_PATH`, and the gateway uses `TRUST_PUBLIC_KEY` and `TRUST_URL`.
+
+**TLS.** `PROTOCOL.md` §1 requires HTTPS on every client connection. Either set `TLS_CERT_FILE`/`TLS_KEY_FILE` (TLS 1.3 is enforced) or run the server behind a TLS terminator such as Caddy or nginx. The same applies to `trust` and `gateway` for server-to-server links; the reference Compose setup keeps those internal/localhost-only until you configure certificates.
 
 ## API
 
@@ -181,12 +196,13 @@ JSON over HTTPS. Protobuf is a later optimization, once the schema stops moving.
 
 ## Roadmap
 
-- [ ] Account/device registration with PoW anti-abuse
-- [ ] Message store-and-forward with TTL cleanup
+- [x] Account/device registration with PoW anti-abuse
+- [x] Message store-and-forward with TTL cleanup
 - [ ] Media upload/download for encrypted attachments
-- [ ] Realtime delivery over WebSocket
-- [ ] Federation gateway and trust service
+- [x] Realtime delivery over WebSocket
+- [x] Federation gateway and trust service (inbound verification, first cut)
 - [ ] Group messaging support
+- [ ] Outbound federation (user → home-server directory, peer routing)
 
 ## Contributing
 

@@ -3,6 +3,12 @@
 # Build from the parent directory (both repos), then:
 #   docker compose -f quietly-server/docker-compose.yml up --build
 #
+# TLS: the server binary supports TLS 1.3 directly via TLS_CERT_FILE /
+# TLS_KEY_FILE (mount your certificates), or put a TLS terminator (Caddy,
+# nginx) in front of `server`. Do not expose `server` in cleartext: PROTOCOL.md
+# §1 requires HTTPS. `trust` and `gateway` are internal-only here; the gateway
+# port is bound to localhost until a real federation deployment terminates TLS
+# in front of it.
 services:
   postgres:
     image: postgres:16-alpine
@@ -48,6 +54,13 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-info}
       MESSAGE_TTL_DAYS: ${MESSAGE_TTL_DAYS:-30}
       POW_DIFFICULTY: ${POW_DIFFICULTY:-18}
+      BUNDLE_FETCH_PER_HOUR: ${BUNDLE_FETCH_PER_HOUR:-60}
+      REQUESTS_PER_MINUTE: ${REQUESTS_PER_MINUTE:-120}
+      WS_ALLOWED_ORIGINS: ${WS_ALLOWED_ORIGINS:-}
+      TLS_CERT_FILE: ${TLS_CERT_FILE:-}
+      TLS_KEY_FILE: ${TLS_KEY_FILE:-}
+    volumes:
+      - ${TLS_DIR:-./tls}:/etc/quietly/tls:ro
     ports:
       - "${SERVER_PORT:-8080}:8080"
 
@@ -60,9 +73,12 @@ services:
     restart: unless-stopped
     environment:
       TRUST_PRIVATE_KEY: ${TRUST_PRIVATE_KEY:-}
+      TRUST_ADMIN_TOKEN: ${TRUST_ADMIN_TOKEN:?set TRUST_ADMIN_TOKEN for the trust service}
+      TRUST_STATE_PATH: /var/lib/quietly/trust-state.json
       TRUST_ADDR: "0.0.0.0:8081"
-    ports:
-      - "${TRUST_PORT:-8081}:8081"
+    volumes:
+      - trust_state:/var/lib/quietly
+    # Internal only: the CA is not reachable from outside the compose network.
 
   gateway:
     build:
@@ -74,13 +90,19 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+      trust:
+        condition: service_started
     environment:
       DATABASE_URL: ${DATABASE_URL}
       TRUST_PUBLIC_KEY: ${TRUST_PUBLIC_KEY:-}
+      TRUST_URL: ${TRUST_URL:-http://trust:8081}
       GATEWAY_ADDR: "0.0.0.0:8082"
     ports:
-      - "${GATEWAY_PORT:-8082}:8082"
+      # Localhost by default: terminate TLS in front before exposing to peers.
+      - "127.0.0.1:${GATEWAY_PORT:-8082}:8082"
 
 volumes:
   postgres_data:
     name: quietly_postgres_data
+  trust_state:
+    name: quietly_trust_state
