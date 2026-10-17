@@ -1,0 +1,62 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: quietly
+          POSTGRES_PASSWORD: quietly
+          POSTGRES_DB: quietly_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U quietly -d quietly_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # The postgres integration tests in internal/storage/postgres run only
+      # when DATABASE_URL is set; here they run against the service container.
+      DATABASE_URL: postgresql://quietly:quietly@localhost:5432/quietly_test?sslmode=disable
+    steps:
+      # go.mod replaces quietly-crypto with ../quietly-crypto, so CI checks
+      # both repos out as siblings. The crypto revision is main: a server PR
+      # that needs unreleased crypto changes must land them on crypto's main
+      # first (or the workflow will fail, loudly).
+      - name: Check out quietly-server
+        uses: actions/checkout@v4
+        with:
+          path: quietly-server
+      - name: Check out quietly-crypto
+        uses: actions/checkout@v4
+        with:
+          repository: quietly-messenger/quietly-crypto
+          path: quietly-crypto
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: quietly-server/go.mod
+          cache: true
+          cache-dependency-path: quietly-server/go.sum
+      - name: Verify gofmt
+        working-directory: quietly-server
+        run: |
+          files=$(gofmt -l ./cmd ./internal)
+          if [ -n "$files" ]; then echo "gofmt needed on:"; echo "$files"; exit 1; fi
+      - name: Vet
+        working-directory: quietly-server
+        run: go vet ./...
+      - name: Test (race)
+        working-directory: quietly-server
+        run: go test -race ./...

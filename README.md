@@ -116,6 +116,8 @@ make migrate-down # roll back the last migration
 make lint         # run golangci-lint
 ```
 
+The suite includes PostgreSQL integration tests (`internal/storage/postgres`). They apply the real migrations to a scratch schema and run **only when `DATABASE_URL` is set** — against the Compose Postgres locally, and against a service container in CI. Without it they skip, so `make test` works with no database running.
+
 ## Project layout
 
 ```
