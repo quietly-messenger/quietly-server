@@ -29,7 +29,7 @@ func newRouter(t *testing.T, limits config.Limits) (http.Handler, *memory.Store)
 	acctSvc := account.New(store, devSvc, limits)
 	msgSvc := message.New(store, limits)
 	hub := ws.NewHub(ws.Options{})
-	srv := transporthttp.NewServer(acctSvc, devSvc, msgSvc, limits, hub)
+	srv := transporthttp.NewServer(acctSvc, devSvc, msgSvc, limits, hub, nil)
 	nonces := auth.NewNonceCache(2 * time.Minute)
 	return srv.Router(store, time.Minute, nonces), store
 }

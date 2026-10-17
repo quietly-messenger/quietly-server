@@ -91,6 +91,9 @@ request times unless deliberately configured not to (§17).
 - [ ] PostgreSQL not exposed publicly; `sslmode=require` or stronger off-host.
 - [ ] Proxy/platform access logs configured deliberately (retention, IP
       logging).
+- [ ] Behind a reverse proxy: `TRUSTED_PROXIES` lists exactly those proxies, so
+      `X-Forwarded-For` is honored only from them (without it the header is
+      ignored and every request keys on the proxy's own address).
 - [ ] Per-IP throttling (`REQUESTS_PER_MINUTE`) and the bundle-fetch limiter
       verified under load.
 - [ ] `POW_DIFFICULTY` raised above the default, plus screening a proof of

@@ -26,6 +26,12 @@ var knownEnvVars = []string{
 	"SPK_ROTATION_DAYS",
 	"SPK_GRACE_DAYS",
 	"DELIVERY_TOKEN_BYTES",
+	"BUNDLE_FETCH_PER_HOUR",
+	"REQUESTS_PER_MINUTE",
+	"WS_PING_INTERVAL_S",
+	"WS_IDLE_TIMEOUT_S",
+	"WS_ALLOWED_ORIGINS",
+	"TRUSTED_PROXIES",
 }
 
 // setValidEnv puts a complete, valid configuration in the environment. Tests
@@ -77,6 +83,36 @@ func TestLoadValid(t *testing.T) {
 	}
 	if cfg.LogLevel != slog.LevelInfo {
 		t.Errorf("LogLevel = %v, want %v", cfg.LogLevel, slog.LevelInfo)
+	}
+}
+
+// TestTrustedProxies covers TRUSTED_PROXIES parsing (audit F-23): CIDRs pass
+// through, bare IPs become host routes, and an unset variable means no peer is
+// trusted.
+func TestTrustedProxies(t *testing.T) {
+	restoreLogLevel(t)
+	setValidEnv(t)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() with unset TRUSTED_PROXIES: %v", err)
+	}
+	if len(cfg.TrustedProxies) != 0 {
+		t.Fatalf("TrustedProxies = %v, want none when unset", cfg.TrustedProxies)
+	}
+
+	t.Setenv("TRUSTED_PROXIES", "10.0.0.0/8, 192.0.2.7, ::1, 2001:db8::/32")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load() with TRUSTED_PROXIES: %v", err)
+	}
+	var got []string
+	for _, n := range cfg.TrustedProxies {
+		got = append(got, n.String())
+	}
+	want := []string{"10.0.0.0/8", "192.0.2.7/32", "::1/128", "2001:db8::/32"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("TrustedProxies = %v, want %v", got, want)
 	}
 }
 
@@ -287,6 +323,7 @@ func TestErrorsNameTheOffendingVariable(t *testing.T) {
 		{name: "pow out of range", envVar: "POW_DIFFICULTY", value: "99", wantVar: "POW_DIFFICULTY"},
 		{name: "log level unset", envVar: "LOG_LEVEL", value: "", wantVar: "LOG_LEVEL"},
 		{name: "log level unknown", envVar: "LOG_LEVEL", value: "trace", wantVar: "LOG_LEVEL"},
+		{name: "trusted proxies malformed", envVar: "TRUSTED_PROXIES", value: "10.0.0.0/8,not-an-ip", wantVar: "TRUSTED_PROXIES"},
 	}
 
 	for _, tt := range tests {

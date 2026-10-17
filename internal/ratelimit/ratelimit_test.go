@@ -45,10 +45,10 @@ func TestEntryCountIsBounded(t *testing.T) {
 	}
 	l.mu.Lock()
 	n := len(l.entries)
-	order := len(l.order)
+	order := l.lru.Len()
 	l.mu.Unlock()
 	if n != 10 || order != 10 {
-		t.Fatalf("entries=%d order=%d, want 10/10 (eviction must bound memory)", n, order)
+		t.Fatalf("entries=%d lru=%d, want 10/10 (eviction must bound memory)", n, order)
 	}
 }
 
@@ -66,5 +66,40 @@ func TestEvictionKeepsRecentKeys(t *testing.T) {
 	}
 	if !hasNew {
 		t.Fatal("newest key was evicted")
+	}
+}
+
+// TestEvictionIsLRU pins the audit F-23 hardening: a key that is still being
+// used must outlive newer one-off keys, so a flood of spoofed keys cannot
+// evict (and thereby reset the buckets of) active clients. Eviction is
+// observed through behavior, not internals: a key whose bucket was drained
+// starts a fresh burst only if it was actually evicted.
+func TestEvictionIsLRU(t *testing.T) {
+	l := New(0, 2, 2) // burst 2, no refill: drained buckets stay empty
+
+	if !l.Allow("active") || !l.Allow("active") {
+		t.Fatal("active key should have two burst tokens")
+	}
+	if l.Allow("active") {
+		t.Fatal("active key should be drained")
+	}
+	// "oneoff" is inserted after "active", draining both of its tokens too.
+	if !l.Allow("oneoff") || !l.Allow("oneoff") {
+		t.Fatal("oneoff key should have two burst tokens")
+	}
+
+	// Touching "active" makes it the most recently used key; "oneoff" becomes
+	// the least recently used.
+	if l.Allow("active") {
+		t.Fatal("drained key refilled without eviction")
+	}
+	// A third key forces one eviction: "oneoff", not "active".
+	l.Allow("third")
+
+	if l.Allow("active") {
+		t.Fatal("active key was evicted and got a fresh burst (FIFO-style eviction)")
+	}
+	if !l.Allow("oneoff") {
+		t.Fatal("least recently used key was not evicted (bucket did not reset)")
 	}
 }

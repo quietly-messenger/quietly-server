@@ -21,8 +21,11 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/quietly-messenger/quietly-server/internal/api"
 	"github.com/quietly-messenger/quietly-server/internal/auth"
+	"github.com/quietly-messenger/quietly-server/internal/config"
 	"github.com/quietly-messenger/quietly-server/internal/federation"
+	"github.com/quietly-messenger/quietly-server/internal/message"
 	"github.com/quietly-messenger/quietly-server/internal/storage"
 	"github.com/quietly-messenger/quietly-server/internal/storage/postgres"
 	"github.com/quietly-messenger/quietly-server/internal/transport/tlsconfig"
@@ -68,6 +71,29 @@ func (rc *revocationCache) refresh(client *http.Client, base string) error {
 	return nil
 }
 
+// deliveryStore is the storage subset /deliver needs.
+type deliveryStore interface {
+	EnqueueMessage(ctx context.Context, m *storage.Message) error
+}
+
+// enqueueDelivery applies §12.13's envelope rules and §15's limits before
+// storing a federated delivery, exactly as message.Submit does on the C2S
+// path: a peer must not be able to queue envelopes larger or longer-lived
+// than the protocol promises (audit F-25).
+func enqueueDelivery(ctx context.Context, store deliveryStore, limits config.Limits, d federation.DeliveryRequest, now time.Time) error {
+	if err := message.ValidateSealed(limits, d.Request.Sealed); err != nil {
+		return err
+	}
+	m := &storage.Message{
+		RecipientUserID:   d.Request.Recipient.UserID,
+		RecipientDeviceID: d.Request.Recipient.DeviceID,
+		Sealed:            d.Request.Sealed,
+		ServerTS:          now,
+		TTLExpiresAt:      now.Add(time.Duration(limits.MessageTTLDays) * 24 * time.Hour),
+	}
+	return store.EnqueueMessage(ctx, m)
+}
+
 func main() {
 	ctx := context.Background()
 
@@ -89,6 +115,7 @@ func main() {
 	defer pool.Close()
 
 	store := postgres.New(pool)
+	limits := config.LoadLimits()
 	revoked := &revocationCache{}
 	trustClient := &http.Client{Timeout: 10 * time.Second}
 	// Fail closed at boot: without the revocation view, deliveries must not be
@@ -128,15 +155,11 @@ func main() {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
-		now := time.Now()
-		m := &storage.Message{
-			RecipientUserID:   d.Request.Recipient.UserID,
-			RecipientDeviceID: d.Request.Recipient.DeviceID,
-			Sealed:            d.Request.Sealed,
-			ServerTS:          now,
-			TTLExpiresAt:      now.Add(30 * 24 * time.Hour),
-		}
-		if err := store.EnqueueMessage(r.Context(), m); err != nil {
+		if err := enqueueDelivery(r.Context(), store, limits, d, time.Now()); err != nil {
+			if ae := api.AsAPIError(err); ae != nil {
+				http.Error(w, ae.Message, ae.Status)
+				return
+			}
 			slog.Error("enqueue", "error", err)
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return

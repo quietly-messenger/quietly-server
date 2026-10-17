@@ -125,25 +125,67 @@ type DispatcherStore interface {
 	UpdatePushEndpoint(ctx context.Context, userID string, deviceID int, endpoint *string) error
 }
 
+// WakeQueue is the number of pending push wakeups the dispatcher buffers before
+// dropping them. Drop-on-full is deliberate: a push is a best-effort hint, and
+// the device still fetches its queue on the next connection — what must never
+// happen is the submit path blocking or spawning unbounded goroutines on a
+// recipient's slow push endpoint (audit F-26).
+const (
+	WakeQueue   = 1024
+	WakeWorkers = 4
+)
+
+// wake is one queued wakeup request.
+type wake struct {
+	userID   string
+	deviceID int
+}
+
 // Dispatcher sends wakeups and retires endpoints that keep failing.
 type Dispatcher struct {
 	store       DispatcherStore
 	client      *http.Client
 	timeout     time.Duration
 	maxFailures int
+	queue       chan wake
 
 	mu       sync.Mutex
 	failures map[string]int
 }
 
-// NewDispatcher builds a dispatcher using the SSRF-hardened client.
+// NewDispatcher builds a dispatcher using the SSRF-hardened client and starts
+// its worker pool.
 func NewDispatcher(store DispatcherStore) *Dispatcher {
-	return &Dispatcher{
+	d := &Dispatcher{
 		store:       store,
 		client:      NewClient(10 * time.Second),
 		timeout:     10 * time.Second,
 		maxFailures: 5,
+		queue:       make(chan wake, WakeQueue),
 		failures:    make(map[string]int),
+	}
+	for i := 0; i < WakeWorkers; i++ {
+		go d.worker()
+	}
+	return d
+}
+
+// Enqueue schedules a wakeup without blocking the caller: the notify path runs
+// inside POST /v1/messages, which must not wait on a recipient's push endpoint
+// (audit F-26). If every worker is busy and the queue is full the wake is
+// dropped rather than queued without bound.
+func (d *Dispatcher) Enqueue(userID string, deviceID int) {
+	select {
+	case d.queue <- wake{userID: userID, deviceID: deviceID}:
+	default:
+		slog.Debug("push wake queue full; dropping wakeup", "user", userID, "device", deviceID)
+	}
+}
+
+// worker drains queued wakeups until the process exits.
+func (d *Dispatcher) worker() {
+	for w := range d.queue {
+		d.Wake(w.userID, w.deviceID)
 	}
 }
 

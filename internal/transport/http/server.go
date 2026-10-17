@@ -27,25 +27,28 @@ import (
 
 // Server bundles the domain services and configuration for the HTTP handlers.
 type Server struct {
-	accounts      *account.Service
-	devices       *device.Service
-	messages      *message.Service
-	limits        config.Limits
-	hub           *ws.Hub
-	ipLimiter     *ratelimit.Limiter
-	bundleLimiter *ratelimit.Limiter
+	accounts       *account.Service
+	devices        *device.Service
+	messages       *message.Service
+	limits         config.Limits
+	hub            *ws.Hub
+	ipLimiter      *ratelimit.Limiter
+	bundleLimiter  *ratelimit.Limiter
+	trustedProxies []*net.IPNet
 }
 
-// NewServer builds the handler bundle.
-func NewServer(accounts *account.Service, devices *device.Service, messages *message.Service, limits config.Limits, hub *ws.Hub) *Server {
+// NewServer builds the handler bundle. trustedProxies lists the peers whose
+// X-Forwarded-For header may be honored for rate-limit keying (empty: never).
+func NewServer(accounts *account.Service, devices *device.Service, messages *message.Service, limits config.Limits, hub *ws.Hub, trustedProxies []*net.IPNet) *Server {
 	return &Server{
-		accounts:      accounts,
-		devices:       devices,
-		messages:      messages,
-		limits:        limits,
-		hub:           hub,
-		ipLimiter:     ratelimit.New(float64(limits.RequestsPerMinute)/60.0, limits.RequestsPerMinute, 10000),
-		bundleLimiter: ratelimit.New(float64(limits.BundleFetchPerHour)/3600.0, limits.BundleFetchPerHour, 10000),
+		accounts:       accounts,
+		devices:        devices,
+		messages:       messages,
+		limits:         limits,
+		hub:            hub,
+		ipLimiter:      ratelimit.New(float64(limits.RequestsPerMinute)/60.0, limits.RequestsPerMinute, 10000),
+		bundleLimiter:  ratelimit.New(float64(limits.BundleFetchPerHour)/3600.0, limits.BundleFetchPerHour, 10000),
+		trustedProxies: trustedProxies,
 	}
 }
 
@@ -88,10 +91,11 @@ func (s *Server) powParams(w http.ResponseWriter, r *http.Request) {
 	api.WriteJSON(w, http.StatusOK, s.accounts.POWParams())
 }
 
-// rateLimit is the per-IP middleware (audit F-01).
+// rateLimit is the per-IP middleware (audit F-01). The key comes from
+// clientIP, which only trusts X-Forwarded-For from configured proxies.
 func (s *Server) rateLimit(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !s.ipLimiter.Allow("ip:" + clientIP(r)) {
+		if !s.ipLimiter.Allow("ip:" + s.clientIP(r)) {
 			w.Header().Set("Retry-After", "60")
 			api.WriteError(w, api.Errorf(api.CodeRateLimited, "rate limited"))
 			return
@@ -100,19 +104,48 @@ func (s *Server) rateLimit(next http.Handler) http.Handler {
 	})
 }
 
-// clientIP extracts the client address, honoring X-Forwarded-For when present.
-func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if i := strings.IndexByte(xff, ','); i >= 0 {
-			return strings.TrimSpace(xff[:i])
-		}
-		return strings.TrimSpace(xff)
-	}
+// clientIP extracts the client address used to key the per-IP rate limiter.
+//
+// X-Forwarded-For is honored only when the direct peer (RemoteAddr) is a
+// configured trusted proxy: any client can set the header, so trusting it from
+// an arbitrary peer is a rate-limit off switch (audit F-23). With a trusted
+// peer, the chain is walked from the right, skipping trusted hops, and the
+// first untrusted address wins — entries further left are attacker-supplied
+// whenever the proxy appends to, rather than overwrites, the header.
+func (s *Server) clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return r.RemoteAddr
+		host = r.RemoteAddr
 	}
+	remote := net.ParseIP(host)
+	if remote == nil || !s.trustedProxy(remote) {
+		return host
+	}
+	hops := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
+	for i := len(hops) - 1; i >= 0; i-- {
+		ip := net.ParseIP(strings.TrimSpace(hops[i]))
+		if ip == nil {
+			// A malformed hop invalidates everything to its left; fall back to
+			// the proxy address so the key stays server-chosen, not
+			// attacker-chosen.
+			return host
+		}
+		if !s.trustedProxy(ip) {
+			return ip.String()
+		}
+	}
+	// Empty chain, or every hop was itself a trusted proxy: the origin address
+	// is not observable, so key conservatively on the direct peer.
 	return host
+}
+
+func (s *Server) trustedProxy(ip net.IP) bool {
+	for _, n := range s.trustedProxies {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) createAccount(w http.ResponseWriter, r *http.Request) {

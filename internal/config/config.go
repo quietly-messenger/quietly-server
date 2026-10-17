@@ -2,6 +2,7 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"os"
@@ -21,6 +22,12 @@ type Config struct {
 	// (§13, WS_ALLOWED_ORIGINS, comma-separated). Native clients send no
 	// Origin header and are unaffected.
 	WsAllowedOrigins []string
+
+	// TrustedProxies lists peers whose X-Forwarded-For header is honored
+	// (TRUSTED_PROXIES, comma-separated IPs or CIDRs). Empty means the header
+	// is ignored from every peer, which is the safe default when the server
+	// is reachable directly (audit F-23).
+	TrustedProxies []*net.IPNet
 
 	// Limits holds the PROTOCOL.md §15 parameters. They are optional and
 	// defaulted; only SERVER_ADDR and DATABASE_URL are required.
@@ -151,18 +158,55 @@ func Load() (*Config, error) {
 		return nil, errors.New("LOG_LEVEL not set")
 	}
 
-	cfg.Limits = loadLimits()
+	cfg.Limits = LoadLimits()
 	cfg.Limits.MessageTTLDays = cfg.MessageTTLDays
 	cfg.Limits.PowDifficulty = cfg.PowDifficulty
 	cfg.WsAllowedOrigins = envList("WS_ALLOWED_ORIGINS")
+	proxies, err := parseTrustedProxies(envList("TRUSTED_PROXIES"))
+	if err != nil {
+		return nil, err
+	}
+	cfg.TrustedProxies = proxies
 
 	return cfg, nil
 }
 
-// loadLimits reads the optional §15 parameters from the environment, falling
-// back to the documented defaults for anything unset or unparseable.
-func loadLimits() Limits {
+// parseTrustedProxies normalizes TRUSTED_PROXIES entries to prefixes, allowing
+// bare IPs as host routes. A malformed entry is a configuration error: silently
+// ignoring a typo would leave the header trusted from nobody — or, worse, from
+// everybody if the operator assumed it worked (audit F-23).
+func parseTrustedProxies(entries []string) ([]*net.IPNet, error) {
+	var out []*net.IPNet
+	for _, e := range entries {
+		if _, n, err := net.ParseCIDR(e); err == nil {
+			out = append(out, n)
+			continue
+		}
+		ip := net.ParseIP(e)
+		if ip == nil {
+			return nil, fmt.Errorf("TRUSTED_PROXIES: %q must be a subnet such as 10.0.0.0/8 or a bare address", e)
+		}
+		if v4 := ip.To4(); v4 != nil {
+			out = append(out, &net.IPNet{IP: v4, Mask: net.CIDRMask(32, 32)})
+		} else {
+			out = append(out, &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)})
+		}
+	}
+	return out, nil
+}
+
+// LoadLimits reads the optional §15 parameters from the environment, falling
+// back to the documented defaults for anything unset or unparseable. Unlike
+// Load it requires no server-only variables, so auxiliary processes — the
+// federation gateway — can enforce the same envelope rules (audit F-25).
+func LoadLimits() Limits {
 	l := DefaultLimits()
+	if v := envInt("MESSAGE_TTL_DAYS"); v > 0 {
+		l.MessageTTLDays = v
+	}
+	if v := envInt("POW_DIFFICULTY"); v > 0 {
+		l.PowDifficulty = v
+	}
 	if v := envInt("AUTH_SKEW_MS"); v > 0 {
 		l.AuthSkewMs = v
 	}

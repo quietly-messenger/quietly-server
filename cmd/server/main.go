@@ -63,9 +63,9 @@ func main() {
 		return messageSvc.Ack(context.Background(), userID, deviceID, id)
 	})
 	dispatcher := push.NewDispatcher(store)
-	hub.SetWake(dispatcher.Wake)
+	hub.SetWake(dispatcher.Enqueue)
 
-	srv := transporthttp.NewServer(accountSvc, deviceSvc, messageSvc, limits, hub)
+	srv := transporthttp.NewServer(accountSvc, deviceSvc, messageSvc, limits, hub, cfg.TrustedProxies)
 	nonces := auth.NewNonceCache(time.Duration(limits.AuthSkewMs*2) * time.Millisecond)
 	handler := srv.Router(store, time.Duration(limits.AuthSkewMs)*time.Millisecond, nonces)
 

@@ -162,12 +162,15 @@ The server is configured entirely through environment variables. See `.env.examp
 | `TLS_CERT_FILE` / `TLS_KEY_FILE` | terminate TLS 1.3 in-process (or leave unset behind a TLS proxy) | — |
 | `BUNDLE_FETCH_PER_HOUR` | per-requesting-device prekey-bundle limit | `60` |
 | `REQUESTS_PER_MINUTE` | per-IP request limit for the HTTP surface | `120` |
+| `TRUSTED_PROXIES` | IPs/CIDRs of reverse proxies whose `X-Forwarded-For` may key the per-IP limiter (empty: header always ignored — audit F-23) | empty |
 | `WS_PING_INTERVAL_S` / `WS_IDLE_TIMEOUT_S` | WebSocket keepalive / idle close | `30` / `90` |
 | `WS_ALLOWED_ORIGINS` | browser origins allowed on `/v1/ws` (native clients unaffected) | empty |
 
 The trust service additionally uses `TRUST_ADMIN_TOKEN` (required — admin bearer token for issuing/revoking certificates), `TRUST_PRIVATE_KEY`, `TRUST_STATE_PATH`, and the gateway uses `TRUST_PUBLIC_KEY` and `TRUST_URL`.
 
 **TLS.** `PROTOCOL.md` §1 requires HTTPS on every client connection. Either set `TLS_CERT_FILE`/`TLS_KEY_FILE` (TLS 1.3 is enforced) or run the server behind a TLS terminator such as Caddy or nginx. The same applies to `trust` and `gateway` for server-to-server links; the reference Compose setup keeps those internal/localhost-only until you configure certificates.
+
+**Reverse proxies.** If a proxy sits in front of the server, set `TRUSTED_PROXIES` to its address(es) so the per-IP rate limiter keys on the forwarded client rather than the proxy. The server ignores `X-Forwarded-For` from any peer not listed there, because an arbitrary client can set that header.
 
 **Deployment privacy.** Anything in front of the server — a reverse proxy, load balancer, or container platform — logs source IPs and request times unless you configure it not to. The protocol minimizes what the server *needs* to know; your logging configuration decides what it *keeps*. See `PROTOCOL.md` §17.
 

@@ -60,7 +60,12 @@ A gateway accepts a delivery only when **all** of the following hold
    (in-memory replay cache; a gateway restart clears it, so the timestamp
    window is the backstop).
 
-Only then is the sealed blob enqueued.
+Only then are the sealed blob enqueued — after applying the same §12.13
+envelope rules as local submission: empty blobs are rejected, and blobs larger
+than §15's `SEALED_BLOB_MAX` or messages with a lifetime other than
+`MESSAGE_TTL_DAYS` are refused (audit F-25). Note the gateway's request-body
+cap (256 KiB) is only a stream limit; the envelope limit is what bounds the
+recipient's queue.
 
 ## Trust service operation
 

@@ -33,15 +33,26 @@ func tokenHash(token []byte) []byte {
 // (PROTOCOL.md §12.14).
 const DefaultFetchLimit = 100
 
+// ValidateSealed applies the §12.13 envelope rules to a sealed blob: it must
+// be non-empty and no larger than §15's SealedBlobMax. It is shared by C2S
+// submission and the federation gateway, which must enforce the same per-
+// message bounds a recipient queue promises (audit F-25).
+func ValidateSealed(limits config.Limits, sealed []byte) error {
+	if len(sealed) == 0 {
+		return api.Errorf(api.CodeInvalidPayload, "sealed blob is empty")
+	}
+	if len(sealed) > limits.SealedBlobMax {
+		return api.Errorf(api.CodePayloadTooLarge, "sealed blob exceeds limit")
+	}
+	return nil
+}
+
 // Submit stores an encrypted envelope for a recipient, gated by the recipient's
 // delivery token (§12.13). All recipient-state failures collapse to a single
 // delivery_rejected error to avoid an oracle. It returns the stored message.
 func (s *Service) Submit(ctx context.Context, req api.MessageSubmit, token []byte, now time.Time) (*storage.Message, error) {
-	if len(req.Sealed) == 0 {
-		return nil, api.Errorf(api.CodeInvalidPayload, "sealed blob is empty")
-	}
-	if len(req.Sealed) > s.limits.SealedBlobMax {
-		return nil, api.Errorf(api.CodePayloadTooLarge, "sealed blob exceeds limit")
+	if err := ValidateSealed(s.limits, req.Sealed); err != nil {
+		return nil, err
 	}
 	if !validUUID(req.Recipient.UserID) {
 		return nil, api.Errorf(api.CodeDeliveryRejected, "delivery rejected")

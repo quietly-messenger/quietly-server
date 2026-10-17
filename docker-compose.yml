@@ -53,10 +53,11 @@ services:
       DATABASE_URL: ${DATABASE_URL}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       MESSAGE_TTL_DAYS: ${MESSAGE_TTL_DAYS:-30}
-      POW_DIFFICULTY: ${POW_DIFFICULTY:-18}
+      POW_DIFFICULTY: ${POW_DIFFICULTY:-20}
       BUNDLE_FETCH_PER_HOUR: ${BUNDLE_FETCH_PER_HOUR:-60}
       REQUESTS_PER_MINUTE: ${REQUESTS_PER_MINUTE:-120}
       WS_ALLOWED_ORIGINS: ${WS_ALLOWED_ORIGINS:-}
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
       TLS_CERT_FILE: ${TLS_CERT_FILE:-}
       TLS_KEY_FILE: ${TLS_KEY_FILE:-}
     volumes:
@@ -97,6 +98,9 @@ services:
       TRUST_PUBLIC_KEY: ${TRUST_PUBLIC_KEY:-}
       TRUST_URL: ${TRUST_URL:-http://trust:8081}
       GATEWAY_ADDR: "0.0.0.0:8082"
+      # Same §15 envelope limits as the server (audit F-25).
+      MESSAGE_TTL_DAYS: ${MESSAGE_TTL_DAYS:-30}
+      SEALED_BLOB_MAX: ${SEALED_BLOB_MAX:-65536}
     ports:
       # Localhost by default: terminate TLS in front before exposing to peers.
       - "127.0.0.1:${GATEWAY_PORT:-8082}:8082"

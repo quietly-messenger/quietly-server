@@ -1,26 +1,29 @@
 // Package ratelimit implements a keyed token-bucket rate limiter. It is
 // bounded: when the entry count exceeds a cap, the least-recently-used key is
-// evicted, so memory cannot grow without bound (audit F-01, F-06).
+// evicted, so memory cannot grow without bound and a flood of one-off keys
+// cannot push out clients that are actively making requests (audit F-01, F-23).
 package ratelimit
 
 import (
+	"container/list"
 	"sync"
 	"time"
 )
 
-// Limiter is a keyed token bucket with FIFO eviction.
+// Limiter is a keyed token bucket with LRU eviction.
 type Limiter struct {
 	mu      sync.Mutex
 	rate    float64 // tokens per second
 	burst   float64 // bucket capacity
 	max     int     // maximum distinct keys
 	entries map[string]*entry
-	order   []string // usage order, oldest first
+	lru     *list.List // front = least recently used; values are keys
 }
 
 type entry struct {
 	tokens float64
 	last   time.Time
+	elem   *list.Element
 }
 
 // New builds a limiter allowing ratePerSec tokens per second with a burst of
@@ -37,10 +40,12 @@ func New(ratePerSec float64, burst, max int) *Limiter {
 		burst:   float64(burst),
 		max:     max,
 		entries: make(map[string]*entry),
+		lru:     list.New(),
 	}
 }
 
 // Allow reports whether one token is available for key, consuming it if so.
+// Every call marks the key as most recently used.
 func (l *Limiter) Allow(key string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -49,13 +54,18 @@ func (l *Limiter) Allow(key string) bool {
 	e, ok := l.entries[key]
 	if !ok {
 		for len(l.entries) >= l.max {
-			oldest := l.order[0]
-			l.order = l.order[1:]
-			delete(l.entries, oldest)
+			oldest := l.lru.Front()
+			if oldest == nil {
+				break
+			}
+			l.lru.Remove(oldest)
+			delete(l.entries, oldest.Value.(string))
 		}
 		e = &entry{tokens: l.burst, last: now}
+		e.elem = l.lru.PushBack(key)
 		l.entries[key] = e
-		l.order = append(l.order, key)
+	} else {
+		l.lru.MoveToBack(e.elem)
 	}
 
 	e.tokens += now.Sub(e.last).Seconds() * l.rate
