@@ -1,0 +1,52 @@
+version: "2"
+
+run:
+  timeout: 3m
+
+linters:
+  # standard = errcheck, govet, ineffassign, staticcheck, unused
+  default: standard
+  enable:
+    - bodyclose      # unclosed HTTP response bodies leak connections
+    - errorlint      # correct error wrapping and comparison (%w, errors.Is/As)
+    - gosec          # security-focused checks; this project earns them
+    - noctx          # HTTP requests without a context
+    - nilerr         # returning nil when err is non-nil
+    - durationcheck  # multiplying two durations
+    - unconvert      # redundant type conversions
+    - gocritic       # broad correctness and style checks
+    - misspell
+
+  settings:
+    errcheck:
+      # an ignored error from a type assertion is a panic waiting to happen
+      check-type-assertions: true
+      check-blank: false
+    gosec:
+      excludes:
+        - G115  # integer conversion overflow; too noisy, and CHECK constraints cover device_id
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - style
+      disabled-checks:
+        - ifElseChain
+        - singleCaseSwitch
+
+  exclusions:
+    generated: lax
+    rules:
+      # tests may ignore errors on cleanup and use weak randomness for fixtures
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gosec
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/quietly-messenger/quietly-server

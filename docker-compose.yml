@@ -1,0 +1,86 @@
+# Quietly deployment: PostgreSQL + home server + trust service + gateway.
+#
+# Build from the parent directory (both repos), then:
+#   docker compose -f quietly-server/docker-compose.yml up --build
+#
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-quietly}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-quietly}
+      POSTGRES_DB: ${POSTGRES_DB:-quietly}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  migrate:
+    image: migrate/migrate:v4.17.1
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./migrations:/migrations:ro
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+    command: ["-path", "/migrations", "-database", "${DATABASE_URL}", "up"]
+    restart: "no"
+
+  server:
+    build:
+      context: ..
+      dockerfile: quietly-server/Dockerfile
+      args:
+        COMPONENT: server
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      SERVER_ADDR: "0.0.0.0:8080"
+      DATABASE_URL: ${DATABASE_URL}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      MESSAGE_TTL_DAYS: ${MESSAGE_TTL_DAYS:-30}
+      POW_DIFFICULTY: ${POW_DIFFICULTY:-18}
+    ports:
+      - "${SERVER_PORT:-8080}:8080"
+
+  trust:
+    build:
+      context: ..
+      dockerfile: quietly-server/Dockerfile
+      args:
+        COMPONENT: trust
+    restart: unless-stopped
+    environment:
+      TRUST_PRIVATE_KEY: ${TRUST_PRIVATE_KEY:-}
+      TRUST_ADDR: "0.0.0.0:8081"
+    ports:
+      - "${TRUST_PORT:-8081}:8081"
+
+  gateway:
+    build:
+      context: ..
+      dockerfile: quietly-server/Dockerfile
+      args:
+        COMPONENT: gateway
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      TRUST_PUBLIC_KEY: ${TRUST_PUBLIC_KEY:-}
+      GATEWAY_ADDR: "0.0.0.0:8082"
+    ports:
+      - "${GATEWAY_PORT:-8082}:8082"
+
+volumes:
+  postgres_data:
+    name: quietly_postgres_data

@@ -4,7 +4,11 @@ Server-side of [Quietly](https://github.com/quietly-messenger) — a messenger w
 
 The server never sees plaintext. It stores and routes ciphertext, device keys, and encrypted media blobs, and that's it. All encryption/decryption happens on the client.
 
-> **Status:** early development, no stable release yet. API and schema will change without notice until v1.
+> **Status:** the MVP home server (accounts, devices, prekeys, delivery tokens,
+> message store-and-forward, WebSocket delivery, PoW), the trust service, and the
+> federation gateway are implemented per `api/v1/PROTOCOL.md`. Not yet a stable
+> release — the API and schema may still change, and federation is a documented
+> first cut (see `docs/FEDERATION.md`).
 
 ## Contents
 
@@ -34,8 +38,8 @@ Federation, the trust/CA service, and group messaging are planned for later stag
 - **Go** — backend language
 - **chi** — HTTP routing and middleware
 - **PostgreSQL** — primary datastore
-- **Protobuf** — wire format for client-server and future server-server messages
-- **Docker Compose** — local development environment
+- **JSON** — wire format (protobuf is deferred, see `api/v1/PROTOCOL.md` §16)
+- **Docker Compose** — local development and deployment
 
 ## Getting started
 
@@ -49,7 +53,26 @@ Federation, the trust/CA service, and group messaging are planned for later stag
   ```
   If your binary is named differently, override it: `make MIGRATE=your-name migrate-up`.
 
-### Setup
+### Run the full stack with Docker
+
+The easiest way to run everything — PostgreSQL, the home server, the trust
+service, and the federation gateway — is Docker Compose. Build from the parent
+directory that contains both `quietly-server` and `quietly-crypto` (the server's
+`go.mod` references quietly-crypto via a local `replace`):
+
+```bash
+git clone https://github.com/quietly-messenger/quietly-server.git
+git clone https://github.com/quietly-messenger/quietly-crypto.git
+cd quietly-server
+cp .env.example .env   # DATABASE_URL already points at the `postgres` service
+
+docker compose up --build
+```
+
+This runs migrations and starts `server` on `:8080`, `trust` on `:8081`, and
+`gateway` on `:8082`.
+
+### Run locally (without Docker)
 
 ```bash
 git clone https://github.com/quietly-messenger/quietly-server.git
@@ -67,7 +90,7 @@ Compose reads the same `.env`, so if you change `POSTGRES_USER`, `POSTGRES_PASSW
 
 ```bash
 # start Postgres
-docker compose up -d
+docker compose up -d postgres
 
 # run migrations
 make migrate-up
@@ -93,18 +116,25 @@ make lint         # run golangci-lint
 ## Project layout
 
 ```
-cmd/server/        entry point, wiring only
+cmd/
+  server/           home server entry point (wiring only)
+  trust/            directory/trust service (CA)
+  gateway/          federation gateway (S2S delivery)
 internal/
-  account/          account creation, PoW verification
-  device/           device registration, prekey management
-  message/          store-and-forward, TTL cleanup
-  auth/             request signature verification
-  storage/postgres/ concrete repository implementations
-  transport/http/   handlers, routes, middleware
+  account/          account creation, PoW verification, username lookup
+  device/           device registration, prekey management, delivery tokens
+  message/          store-and-forward, TTL
+  auth/             request signature verification middleware
+  api/              JSON wire types + error model
+  id/               UUIDv4 + monotonic ULID generation
+  storage/          Store interface + postgres implementation
+  transport/http/   handlers, routes
+  transport/ws/     WebSocket hub
+  federation/       S2S types + cert/signature verification
+  trust/            certificate authority
   config/           env-based configuration
 migrations/         SQL schema migrations
-api/                protobuf/openapi definitions
-deploy/             Dockerfile, systemd units
+docs/FEDERATION.md  federation design (first cut)
 ```
 
 `internal/` holds anything that isn't meant to be imported outside this module. Handlers stay thin — parsing and responses only; business logic lives in the domain packages.

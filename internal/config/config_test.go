@@ -15,6 +15,17 @@ var knownEnvVars = []string{
 	"MESSAGE_TTL_DAYS",
 	"POW_DIFFICULTY",
 	"LOG_LEVEL",
+	"AUTH_SKEW_MS",
+	"POW_WINDOW_MS",
+	"MAX_DEVICES_PER_ACCOUNT",
+	"OTP_BATCH_SIZE",
+	"OTP_REPLENISH_THRESHOLD",
+	"OTP_MAX_STORED",
+	"SEALED_BLOB_MAX",
+	"FETCH_LIMIT_MAX",
+	"SPK_ROTATION_DAYS",
+	"SPK_GRACE_DAYS",
+	"DELIVERY_TOKEN_BYTES",
 }
 
 // setValidEnv puts a complete, valid configuration in the environment. Tests
@@ -327,4 +338,32 @@ func slicesContains(haystack []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+func TestLimitsDefaultsAndOverride(t *testing.T) {
+	setValidEnv(t)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load(): %v", err)
+	}
+	if cfg.Limits.AuthSkewMs != 60_000 {
+		t.Errorf("AuthSkewMs default = %d, want 60000", cfg.Limits.AuthSkewMs)
+	}
+	if cfg.Limits.SealedBlobMax != 64*1024 {
+		t.Errorf("SealedBlobMax default = %d, want %d", cfg.Limits.SealedBlobMax, 64*1024)
+	}
+
+	t.Setenv("AUTH_SKEW_MS", "45000")
+	t.Setenv("MAX_DEVICES_PER_ACCOUNT", "7")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load(): %v", err)
+	}
+	if cfg.Limits.AuthSkewMs != 45_000 {
+		t.Errorf("AuthSkewMs override = %d, want 45000", cfg.Limits.AuthSkewMs)
+	}
+	if cfg.Limits.MaxDevicesPerAccount != 7 {
+		t.Errorf("MaxDevicesPerAccount override = %d, want 7", cfg.Limits.MaxDevicesPerAccount)
+	}
 }
