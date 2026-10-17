@@ -387,6 +387,16 @@ func (s *Store) RecordPreKeyIssuance(ctx context.Context, requesterUserID string
 	return err
 }
 
+// PrunePreKeyIssuances deletes issuance records past the §7.2.1 idempotency
+// window (audit F-02 residual).
+func (s *Store) PrunePreKeyIssuances(ctx context.Context, before time.Time) (int, error) {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM prekey_issuances WHERE issued_at < $1`, before)
+	if err != nil {
+		return 0, err
+	}
+	return int(tag.RowsAffected()), nil
+}
+
 func (s *Store) DeleteMessagesForDevice(ctx context.Context, userID string, deviceID int) error {
 	_, err := s.pool.Exec(ctx,
 		`DELETE FROM messages WHERE recipient_user_id = $1 AND recipient_device_id = $2`,

@@ -116,7 +116,9 @@ func netAddr(cfg *config.Config) string {
 }
 
 // ttlCleanup periodically deletes expired undelivered messages (§15:
-// message_ttl_days).
+// message_ttl_days) and one-time-prekey issuance records that are past their
+// §7.2.1 idempotency window, so neither table grows without bound (audit F-02
+// residual).
 func ttlCleanup(ctx context.Context, store *postgres.Store, interval time.Duration) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
@@ -125,13 +127,20 @@ func ttlCleanup(ctx context.Context, store *postgres.Store, interval time.Durati
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			n, err := store.DeleteExpiredMessages(ctx, time.Now())
+			now := time.Now()
+			n, err := store.DeleteExpiredMessages(ctx, now)
 			if err != nil {
 				slog.Warn("ttl cleanup", "error", err)
-				continue
-			}
-			if n > 0 {
+			} else if n > 0 {
 				slog.Info("ttl cleanup", "deleted", n)
+			}
+			// Issuance records only matter for the re-fetch window, so prune
+			// with a wide margin.
+			pruned, err := store.PrunePreKeyIssuances(ctx, now.Add(-2*device.OTPIdempotencyWindow))
+			if err != nil {
+				slog.Warn("issuance cleanup", "error", err)
+			} else if pruned > 0 {
+				slog.Info("issuance cleanup", "deleted", pruned)
 			}
 		}
 	}

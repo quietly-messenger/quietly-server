@@ -391,6 +391,56 @@ func TestPreKeyIssuanceRoundTrip(t *testing.T) {
 	}
 }
 
+// TestPrunePreKeyIssuances covers the F-02 residual at the SQL layer: records
+// past the §7.2.1 window are deleted, fresh ones survive, and the count says
+// how many rows went away.
+func TestPrunePreKeyIssuances(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	req, _ := mustAccount(t, st, "iris")
+	old, _ := mustAccount(t, st, "jack")
+	fresh, _ := mustAccount(t, st, "kate")
+
+	oldKey := storage.OneTimePreKey{ID: 1, PublicKey: rb(t, 32)}
+	freshKey := storage.OneTimePreKey{ID: 2, PublicKey: rb(t, 32)}
+	if err := st.RecordPreKeyIssuance(ctx, req.ID, 1, old.ID, 1, oldKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordPreKeyIssuance(ctx, req.ID, 1, fresh.ID, 1, freshKey); err != nil {
+		t.Fatal(err)
+	}
+
+	// Backdate the first record past the window.
+	if _, err := st.pool.Exec(ctx,
+		`UPDATE prekey_issuances SET issued_at = now() - interval '25 hours' WHERE target_user_id = $1`,
+		old.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := st.PrunePreKeyIssuances(ctx, time.Now().Add(-24*time.Hour))
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("pruned %d rows, want 1", n)
+	}
+	if _, _, err := st.GetPreKeyIssuance(ctx, req.ID, 1, old.ID, 1); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("expired issuance error = %v, want ErrNotFound", err)
+	}
+	got, _, err := st.GetPreKeyIssuance(ctx, req.ID, 1, fresh.ID, 1)
+	if err != nil {
+		t.Fatalf("fresh issuance: %v", err)
+	}
+	if got.ID != freshKey.ID {
+		t.Fatalf("fresh issuance id = %d, want %d", got.ID, freshKey.ID)
+	}
+
+	// A second pass has nothing left to delete.
+	if n, err := st.PrunePreKeyIssuances(ctx, time.Now().Add(-24*time.Hour)); err != nil || n != 0 {
+		t.Fatalf("second prune = %d, %v; want 0, nil", n, err)
+	}
+}
+
 // TestMessageLifecycle covers enqueue/list/ack/expiry semantics on the real
 // queries, including ULID ordering for messages sharing a timestamp.
 func TestMessageLifecycle(t *testing.T) {

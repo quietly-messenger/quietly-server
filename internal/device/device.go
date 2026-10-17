@@ -145,9 +145,10 @@ func (s *Service) Revoke(ctx context.Context, userID string, deviceID int) error
 	return nil
 }
 
-// otpIdempotencyWindow is the per-pair one-time-prekey re-fetch window
-// (PROTOCOL.md §15: otp_idempotency_window_h = 24).
-const otpIdempotencyWindow = 24 * time.Hour
+// OTPIdempotencyWindow is the per-pair one-time-prekey re-fetch window
+// (PROTOCOL.md §15: otp_idempotency_window_h = 24). The server's janitor uses
+// it to prune older issuance records (audit F-02 residual).
+const OTPIdempotencyWindow = 24 * time.Hour
 
 // PreKeyBundle returns the recipient's bundle, consuming one one-time prekey
 // (§7.2, §12.7). Repeat fetches by the same requester within the idempotency
@@ -167,7 +168,7 @@ func (s *Service) PreKeyBundle(ctx context.Context, requesterUserID string, requ
 	}
 
 	var otpk *storage.OneTimePreKey
-	if prev, at, err := s.store.GetPreKeyIssuance(ctx, requesterUserID, requesterDeviceID, targetUserID, targetDeviceID); err == nil && time.Since(at) < otpIdempotencyWindow {
+	if prev, at, err := s.store.GetPreKeyIssuance(ctx, requesterUserID, requesterDeviceID, targetUserID, targetDeviceID); err == nil && time.Since(at) < OTPIdempotencyWindow {
 		otpk = prev
 	} else {
 		otpk, err = s.store.TakeOneTimePreKey(ctx, targetUserID, targetDeviceID)

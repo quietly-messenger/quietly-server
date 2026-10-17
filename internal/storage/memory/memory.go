@@ -385,6 +385,19 @@ func (s *Store) RecordPreKeyIssuance(_ context.Context, requesterUserID string, 
 	return nil
 }
 
+func (s *Store) PrunePreKeyIssuances(_ context.Context, before time.Time) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for k, iss := range s.issuances {
+		if iss.issuedAt.Before(before) {
+			delete(s.issuances, k)
+			n++
+		}
+	}
+	return n, nil
+}
+
 // --- Messages ---
 
 func (s *Store) EnqueueMessage(_ context.Context, m *storage.Message) error {

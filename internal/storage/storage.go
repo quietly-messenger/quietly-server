@@ -88,6 +88,10 @@ type Store interface {
 	CountAvailablePreKeys(ctx context.Context, userID string, deviceID int) (int, error)
 	GetPreKeyIssuance(ctx context.Context, requesterUserID string, requesterDeviceID int, targetUserID string, targetDeviceID int) (*OneTimePreKey, time.Time, error)
 	RecordPreKeyIssuance(ctx context.Context, requesterUserID string, requesterDeviceID int, targetUserID string, targetDeviceID int, prekey OneTimePreKey) error
+	// PrunePreKeyIssuances deletes issuance records older than before and
+	// reports how many were removed, so the §7.2.1 idempotency table cannot
+	// grow without bound (audit F-02 residual).
+	PrunePreKeyIssuances(ctx context.Context, before time.Time) (int, error)
 
 	// Messages
 	EnqueueMessage(ctx context.Context, m *Message) error
