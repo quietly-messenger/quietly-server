@@ -924,11 +924,57 @@ Reserved now so that adding them is not a breaking change:
 - **`group_id`** (§10.2) — 16 bytes, all zero at v1.
 - **Sender certificates** (§10.4) — would add a signed sender assertion inside the sealed payload.
 - **Server-issued PoW challenges** (§4) — a short-lived challenge nonce binding each solve to a recent issuance, closing the stockpiling window.
-- **Traffic shaping** (§17) — padding and cover traffic; small deployments are trivially correlatable without them.
+- **Traffic shaping** (§16.1) — size padding is specified; cover traffic remains reserved.
 - **Federation** — `user_id` is globally unique as a UUID, so a future `domain` field on the envelope routes cross-server without changing identity.
 - **Protobuf** — the JSON shapes here map one-to-one; the binary layouts (§9, §10) are already final and would be unaffected.
 
 Anything not listed here is not reserved. Adding it later is a version bump.
+
+### 16.1 Size padding (specified)
+
+The client pads every message's app content so the sealed blob the server
+stores has one of a fixed set of sizes, removing the message-length signal
+(§17). This is specified rather than merely reserved because the padding format
+is shared client code — not a server-visible wire field.
+
+Buckets (final sealed-blob size, ascending):
+
+```
+512 B, 1 KiB, 4 KiB, 16 KiB, 64 KiB
+```
+
+The 64 KiB bucket respects `sealed_blob_max` for both message kinds.
+
+Padding is applied *inside* the ratchet ciphertext — to the app content, before
+encryption — so the frozen §9/§10 wire layouts are untouched and no known-answer
+test changes. The framed app content is:
+
+```
+u32 BE original_len || payload || 0x00 padding
+```
+
+`original_len` is the unpadded app-content length; padding bytes are zero. A
+decoder MUST fail closed on a truncated frame, an `original_len` larger than
+the remaining bytes, or a non-zero padding tail. The target bucket is the
+smallest one whose size is at least
+
+```
+original_len + 4 (frame) + kind_overhead
+```
+
+where `kind_overhead` is 172 bytes for a normal message (`0x02`) and 276 bytes
+for an initial message (`0x01`) — the fixed §9/§10 overheads. Initial and
+normal messages therefore remain distinguishable by their ~104-byte overhead
+difference; this is accepted and must not be "fixed" by merging the two
+families.
+
+Padding is implemented once in `quietly-crypto` (`protocol.PadToBucket` /
+`Unpad`, and `ffi.quietly_pad_payload` / `quietly_unpad_payload`) and MUST NOT
+be re-implemented in any client. The server never parses the framing; it only
+ever observes sealed-blob lengths that land in the bucket set.
+
+Cover traffic (fixed-rate decoy submissions) is **not** implemented and remains
+a documented residual in §17.
 
 ---
 
@@ -939,7 +985,7 @@ Stated plainly, because a protocol that pretends to leak nothing is worse than o
 The server **can** observe:
 
 - Which device fetched a prekey bundle for which device, and when. **This reveals who is starting a conversation with whom**, at session start. Sealed sender hides the sender of every subsequent message but not this first act.
-- The recipient of every message, its size, and its timing. Traffic analysis over these three is the primary residual attack.
+- The recipient of every message, its quantized size (one of the five §16.1 padding buckets), and its timing. Traffic analysis over recipient and timing is the primary residual attack; message size is no longer a continuous signal.
 - Which devices are connected by WebSocket, and when — an online-presence signal, even though presence is never exposed via the API.
 - The IP address of every request, including unauthenticated submissions.
 - The push endpoint URL a device registers: the push provider (and anything on the path to it) learns that URL, including any identity a client embeds in it. Clients SHOULD register opaque, rotatable topics and treat the endpoint as provider-visible metadata (§12.12).
@@ -951,7 +997,7 @@ The server **cannot** observe:
 - Whether a message is 1:1 or group, once groups exist (§10.2).
 - Anything from the push wakeup (§13.3), which is why the push provider is untrusted infrastructure rather than a trusted component.
 
-Not addressed at v1, and not claimed: cover traffic, padding to a fixed size, timing obfuscation, or protection against a global passive adversary correlating both ends.
+Not addressed, and not claimed: cover traffic, timing obfuscation, or protection against a global passive adversary correlating both ends. Size padding (§16.1) removes the length signal but does nothing about *who* talks to *whom* or *when*; the remaining signals are the ones a low-traffic deployment makes easy to correlate.
 
 Deployment reality belongs on this list too. Any reverse proxy, load balancer, TLS terminator, or container platform in front of the home server **logs source IP addresses and request times unless explicitly configured not to**. The register above describes the protocol, not the deployment; an operator's logging configuration is part of the metadata story, and self-hosting is only as private as the box it runs on.
 
@@ -967,3 +1013,5 @@ Stated so they are decisions rather than oversights:
 | Delivery tokens are plaintext at rest (§6) | The server must return them to senders, so a database compromise yields spam rights for every device. Rotation invalidates harvested copies; content is never at risk. |
 | No sender certificates (§10.4) | Inner ratchet authenticates the sender. Cost is undecryptable-message noise, not impersonation. |
 | Hand-written protocol implementation | Mitigated by test vectors and property tests, not by external audit. **No third-party review has been done.** Required before any public beta. |
+| Initial vs normal messages differ by ~104 B of overhead (§16.1) | Accepted: padding quantizes to the bucket set but does not merge the two message families. |
+| Size padding adds ~4 KiB worst-case for messages near the top of a bucket (§16.1) | Accepted as the cost of removing the length signal; buckets are configurable client-side. |
