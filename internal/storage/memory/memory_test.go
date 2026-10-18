@@ -18,7 +18,7 @@ func TestMessagesRespectNotBefore(t *testing.T) {
 	s.messages["past"] = &storage.Message{ID: "past", RecipientUserID: "u", RecipientDeviceID: 1, NotBefore: now.Add(-time.Hour)}
 	s.messages["future"] = &storage.Message{ID: "future", RecipientUserID: "u", RecipientDeviceID: 1, NotBefore: now.Add(time.Hour)}
 
-	future, err := s.PendingMessages(ctx, now, 10)
+	future, err := s.PendingMessages(ctx, now, time.Time{}, "", 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,6 +32,50 @@ func TestMessagesRespectNotBefore(t *testing.T) {
 	}
 	if len(due) != 1 || due[0].ID != "past" {
 		t.Fatalf("ListMessages = %v, want [past]", idsOf(due))
+	}
+}
+
+// TestPendingMessagesCursor walks the (not_before, id) keyset cursor across a
+// backlog, including same-release-time ties (audit F-28 contract at the store
+// layer).
+func TestPendingMessagesCursor(t *testing.T) {
+	s := New()
+	ctx := context.Background()
+	now := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
+	at := now.Add(time.Hour)
+	for _, id := range []string{"a", "b", "c"} {
+		s.messages[id] = &storage.Message{ID: id, RecipientUserID: "u", RecipientDeviceID: 1, NotBefore: at}
+	}
+	s.messages["d"] = &storage.Message{ID: "d", RecipientUserID: "u", RecipientDeviceID: 1, NotBefore: at.Add(time.Second)}
+
+	var got []string
+	cursor, cursorID := time.Time{}, ""
+	for page := 0; page < 3; page++ {
+		ms, err := s.PendingMessages(ctx, now, cursor, cursorID, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if page == 2 {
+			if len(ms) != 0 {
+				t.Fatalf("final page = %v, want empty", idsOf(ms))
+			}
+			break
+		}
+		if len(ms) != 2 {
+			t.Fatalf("page %d = %v, want 2 rows", page, idsOf(ms))
+		}
+		got = append(got, idsOf(ms)...)
+		last := ms[len(ms)-1]
+		cursor, cursorID = last.NotBefore, last.ID
+	}
+	want := []string{"a", "b", "c", "d"}
+	if len(got) != len(want) {
+		t.Fatalf("cursor walk = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("cursor walk = %v, want %v", got, want)
+		}
 	}
 }
 

@@ -169,19 +169,9 @@ func (s *Service) PreKeyBundle(ctx context.Context, targetUserID string, targetD
 	}
 
 	windowStart := now.Truncate(OTPIdempotencyWindow)
-	var otpk *storage.OneTimePreKey
-	if prev, _, err := s.store.GetPreKeyIssuance(ctx, targetUserID, targetDeviceID, windowStart); err == nil {
-		otpk = prev
-	} else {
-		otpk, err = s.store.TakeOneTimePreKey(ctx, targetUserID, targetDeviceID)
-		if err != nil && err != storage.ErrNotFound {
-			return nil, time.Time{}, api.Errorf(api.CodeInternalError, "prekey fetch failed")
-		}
-		if otpk != nil {
-			if err := s.store.RecordPreKeyIssuance(ctx, targetUserID, targetDeviceID, windowStart, *otpk); err != nil {
-				return nil, time.Time{}, api.Errorf(api.CodeInternalError, "prekey issuance failed")
-			}
-		}
+	otpk, err := s.store.IssueOneTimePreKey(ctx, targetUserID, targetDeviceID, windowStart)
+	if err != nil {
+		return nil, time.Time{}, api.Errorf(api.CodeInternalError, "prekey issuance failed")
 	}
 
 	remaining, err := s.store.CountAvailablePreKeys(ctx, targetUserID, targetDeviceID)

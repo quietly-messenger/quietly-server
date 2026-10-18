@@ -3,7 +3,10 @@ package postgres
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
+	"hash/fnv"
+	"io"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -386,6 +389,87 @@ func (s *Store) RecordPreKeyIssuance(ctx context.Context, targetUserID string, t
 	return err
 }
 
+// issuanceLockKey derives a stable advisory-lock key from the issuance bucket.
+// Collisions only over-serialize; correctness comes from mutual exclusion, not
+// from the hash.
+func issuanceLockKey(targetUserID string, targetDeviceID int, windowStart time.Time) int64 {
+	h := fnv.New64a()
+	_, _ = io.WriteString(h, targetUserID)
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], uint64(windowStart.Unix()))
+	_, _ = h.Write(buf[:])
+	binary.BigEndian.PutUint32(buf[:4], uint32(targetDeviceID))
+	_, _ = h.Write(buf[:4])
+	return int64(h.Sum64())
+}
+
+// IssueOneTimePreKey returns the OTPK already issued for the (target, window)
+// bucket, or takes and records a fresh one, all within one transaction guarded
+// by an advisory lock so concurrent fetches share one OTPK per window (audit
+// F-27). It returns a nil prekey when the pool is exhausted.
+func (s *Store) IssueOneTimePreKey(ctx context.Context, targetUserID string, targetDeviceID int, windowStart time.Time) (*storage.OneTimePreKey, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // harmless after Commit
+
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, issuanceLockKey(targetUserID, targetDeviceID, windowStart)); err != nil {
+		return nil, err
+	}
+
+	var p storage.OneTimePreKey
+	err = tx.QueryRow(ctx,
+		`SELECT prekey_id, public_key FROM prekey_issuances
+		 WHERE target_user_id = $1 AND target_device_id = $2 AND window_start = $3`,
+		targetUserID, targetDeviceID, windowStart,
+	).Scan(&p.ID, &p.PublicKey)
+	if err == nil {
+		if err := tx.Commit(ctx); err != nil {
+			return nil, err
+		}
+		return &p, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, err
+	}
+
+	err = tx.QueryRow(ctx,
+		`WITH picked AS (
+		    SELECT prekey_id FROM one_time_prekeys
+		    WHERE device_user_id = $1 AND device_id = $2 AND NOT used
+		    ORDER BY prekey_id LIMIT 1 FOR UPDATE SKIP LOCKED
+		 )
+		 UPDATE one_time_prekeys SET used = true
+		 FROM picked
+		 WHERE one_time_prekeys.prekey_id = picked.prekey_id
+		   AND one_time_prekeys.device_user_id = $1 AND one_time_prekeys.device_id = $2
+		 RETURNING one_time_prekeys.prekey_id, one_time_prekeys.public_key`,
+		targetUserID, targetDeviceID,
+	).Scan(&p.ID, &p.PublicKey)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if err := tx.Commit(ctx); err != nil {
+			return nil, err
+		}
+		return nil, nil // exhausted
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO prekey_issuances (target_user_id, target_device_id, window_start, prekey_id, public_key)
+		 VALUES ($1, $2, $3, $4, $5)`,
+		targetUserID, targetDeviceID, windowStart, p.ID, p.PublicKey,
+	); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
 // PrunePreKeyIssuances deletes issuance records past the §7.2.1 idempotency
 // window (audit F-02 residual).
 func (s *Store) PrunePreKeyIssuances(ctx context.Context, before time.Time) (int, error) {
@@ -443,14 +527,15 @@ func (s *Store) ListMessages(ctx context.Context, userID string, deviceID int, n
 }
 
 // PendingMessages returns future-due messages (not_before > now) ordered by
-// release time, for post-restart notification recovery (TASK-001 B).
-func (s *Store) PendingMessages(ctx context.Context, now time.Time, limit int) ([]storage.Message, error) {
+// (not_before, id), strictly after the cursor, for post-restart notification
+// recovery (TASK-001 B, audit F-28).
+func (s *Store) PendingMessages(ctx context.Context, now time.Time, afterNotBefore time.Time, afterID string, limit int) ([]storage.Message, error) {
 	rows, err := s.pool.Query(ctx,
 		`SELECT id, recipient_user_id::text, recipient_device_id, sealed, server_ts, not_before, ttl_expires_at
 		 FROM messages
-		 WHERE not_before > $1
-		 ORDER BY not_before, id LIMIT $2`,
-		now, limit)
+		 WHERE not_before > $1 AND (not_before, id) > ($2, $3)
+		 ORDER BY not_before, id LIMIT $4`,
+		now, afterNotBefore, afterID, limit)
 	if err != nil {
 		return nil, err
 	}

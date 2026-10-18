@@ -2,6 +2,7 @@ package device_test
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -102,6 +103,61 @@ func TestPreKeyBundleWindowAdvances(t *testing.T) {
 	}
 	if second.OneTimePrekey.ID == first.OneTimePrekey.ID {
 		t.Fatalf("next window returned the same prekey %d", first.OneTimePrekey.ID)
+	}
+}
+
+// TestPreKeyBundleConcurrentFetchesShareOneOTPK is the permanent regression for
+// audit F-27: §7.2.1 mitigation 2 promises "one OTPK per target per window
+// regardless of how many distinct clients fetch", including fetches that race
+// before any issuance record exists. Concurrent bundles must all return the
+// same OTPK and consume exactly one.
+func TestPreKeyBundleConcurrentFetchesShareOneOTPK(t *testing.T) {
+	store := memory.New()
+	limits := testutil.Limits()
+	ids := make([]uint32, 64)
+	for i := range ids {
+		ids[i] = uint32(i + 1)
+	}
+	alice := testutil.NewAccount(t, store, limits, "alice", ids...)
+	svc := device.New(store, limits)
+	ctx := context.Background()
+	now := time.Now()
+
+	const G = 64
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	var mu sync.Mutex
+	distinct := map[uint32]int{}
+	for i := 0; i < G; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			resp, _, err := svc.PreKeyBundle(ctx, alice.UserID, alice.DeviceID, now)
+			if err != nil {
+				t.Errorf("bundle: %v", err)
+				return
+			}
+			if resp.OneTimePrekey == nil {
+				return
+			}
+			mu.Lock()
+			distinct[resp.OneTimePrekey.ID]++
+			mu.Unlock()
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if len(distinct) != 1 {
+		t.Fatalf("concurrent fetches handed out %d distinct OTPKs, want exactly 1", len(distinct))
+	}
+	rem, err := store.CountAvailablePreKeys(ctx, alice.UserID, alice.DeviceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rem != len(ids)-1 {
+		t.Fatalf("remaining prekeys = %d, want %d (exactly one consumed)", rem, len(ids)-1)
 	}
 }
 

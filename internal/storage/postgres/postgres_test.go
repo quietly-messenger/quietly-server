@@ -346,6 +346,74 @@ func TestTakeOneTimePreKeyConcurrent(t *testing.T) {
 	}
 }
 
+// TestIssueOneTimePreKeyConcurrent is the permanent regression for audit F-27
+// at the SQL layer: racing first fetches for the same (target, window) must
+// share one OTPK and consume exactly one (advisory-lock serialization instead
+// of a racy check-then-take).
+func TestIssueOneTimePreKeyConcurrent(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	target, _ := mustAccount(t, st, "hazel")
+
+	const total, workers = 64, 64
+	prekeys := make([]storage.OneTimePreKey, total)
+	for i := range prekeys {
+		prekeys[i] = storage.OneTimePreKey{ID: uint32(i + 1), PublicKey: rb(t, 32)}
+	}
+	if err := st.AddOneTimePreKeys(ctx, target.ID, 1, prekeys); err != nil {
+		t.Fatal(err)
+	}
+	w := time.Now().UTC().Truncate(24 * time.Hour)
+
+	var mu sync.Mutex
+	distinct := map[uint32]int{}
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			p, err := st.IssueOneTimePreKey(ctx, target.ID, 1, w)
+			if err != nil {
+				t.Errorf("concurrent issue: %v", err)
+				return
+			}
+			if p == nil {
+				t.Error("concurrent issue returned nil prekey with a non-empty pool")
+				return
+			}
+			mu.Lock()
+			distinct[p.ID]++
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	if len(distinct) != 1 {
+		t.Fatalf("concurrent issues produced %d distinct keys, want 1", len(distinct))
+	}
+	if n, err := st.CountAvailablePreKeys(ctx, target.ID, 1); err != nil || n != total-1 {
+		t.Fatalf("CountAvailablePreKeys = %d (err %v), want %d", n, err, total-1)
+	}
+
+	// A later window takes a fresh key, then draining the pool yields nil (no
+	// error) on the exhausted window.
+	next, err := st.IssueOneTimePreKey(ctx, target.ID, 1, w.Add(24*time.Hour))
+	if err != nil || next == nil {
+		t.Fatalf("next window issue = %v (err %v), want a prekey", next, err)
+	}
+	if _, ok := distinct[next.ID]; ok {
+		t.Fatalf("next window reused prekey %d", next.ID)
+	}
+	for i := 0; i < total-2; i++ {
+		p, err := st.IssueOneTimePreKey(ctx, target.ID, 1, w.Add(time.Duration(i+2)*24*time.Hour))
+		if err != nil || p == nil {
+			t.Fatalf("drain issue %d = %v (err %v), want a prekey", i, p, err)
+		}
+	}
+	if p, err := st.IssueOneTimePreKey(ctx, target.ID, 1, w.Add(time.Duration(total)*24*time.Hour)); err != nil || p != nil {
+		t.Fatalf("exhausted issue = %v (err %v), want nil,nil", p, err)
+	}
+}
+
 // TestPreKeyIssuanceRoundTrip covers the §7.2.1 idempotency table: recording
 // is an upsert, so a re-fetch window refresh replaces the stored key.
 func TestPreKeyIssuanceRoundTrip(t *testing.T) {
@@ -577,7 +645,7 @@ func TestMessageNotBeforeAndPending(t *testing.T) {
 		t.Fatalf("released list = %v, want [%s]", ids(got), due.ID)
 	}
 
-	pend, err := st.PendingMessages(ctx, now, 100)
+	pend, err := st.PendingMessages(ctx, now, time.Time{}, "", 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -593,8 +661,59 @@ func TestMessageNotBeforeAndPending(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("after release: %v, want 2", ids(got))
 	}
-	if pend, err = st.PendingMessages(ctx, now.Add(2*time.Minute), 100); err != nil || len(pend) != 0 {
+	if pend, err = st.PendingMessages(ctx, now.Add(2*time.Minute), time.Time{}, "", 100); err != nil || len(pend) != 0 {
 		t.Fatalf("pending after release = %v (err %v), want empty", ids(pend), err)
+	}
+}
+
+// TestPendingMessagesCursor walks the (not_before, id) keyset cursor on the
+// real SQL path: pages neither overlap nor skip, including same-release-time
+// ties (audit F-28).
+func TestPendingMessagesCursor(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	u, _ := mustAccount(t, st, "olive")
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	at := now.Add(time.Hour)
+
+	var want []string
+	for i := 0; i < 5; i++ {
+		when := at
+		if i >= 3 {
+			when = at.Add(time.Duration(i-2) * time.Second) // two later rows
+		}
+		m := &storage.Message{RecipientUserID: u.ID, RecipientDeviceID: 1, Sealed: []byte{byte(i)},
+			ServerTS: now, NotBefore: when, TTLExpiresAt: now.Add(2 * time.Hour)}
+		if err := st.EnqueueMessage(ctx, m); err != nil {
+			t.Fatal(err)
+		}
+		want = append(want, m.ID) // enqueue order == (not_before, id) order (monotonic ULIDs)
+	}
+
+	var got []string
+	cursor, cursorID := time.Time{}, ""
+	for pages := 0; ; pages++ {
+		if pages > 10 {
+			t.Fatalf("cursor walk did not terminate: got %v, want %v", got, want)
+		}
+		page, err := st.PendingMessages(ctx, now, cursor, cursorID, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(page) == 0 {
+			break
+		}
+		got = append(got, ids(page)...)
+		last := page[len(page)-1]
+		cursor, cursorID = last.NotBefore, last.ID
+	}
+	if len(got) != len(want) {
+		t.Fatalf("cursor walk = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("cursor walk = %v, want %v", got, want)
+		}
 	}
 }
 

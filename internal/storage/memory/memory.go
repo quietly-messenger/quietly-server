@@ -333,6 +333,16 @@ func (s *Store) AddOneTimePreKeys(_ context.Context, userID string, deviceID int
 func (s *Store) TakeOneTimePreKey(_ context.Context, userID string, deviceID int) (*storage.OneTimePreKey, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	p := s.takeOneTimePreKeyLocked(userID, deviceID)
+	if p == nil {
+		return nil, storage.ErrNotFound
+	}
+	return p, nil
+}
+
+// takeOneTimePreKeyLocked consumes the lowest-id unused OTPK, or returns nil
+// when the pool is exhausted. The caller must hold s.mu.
+func (s *Store) takeOneTimePreKeyLocked(userID string, deviceID int) *storage.OneTimePreKey {
 	recs := s.prekeys[deviceKey{userID: userID, id: deviceID}]
 	var best *prekeyRecord
 	var bestID uint32
@@ -345,11 +355,11 @@ func (s *Store) TakeOneTimePreKey(_ context.Context, userID string, deviceID int
 		}
 	}
 	if best == nil {
-		return nil, storage.ErrNotFound
+		return nil
 	}
 	best.used = true
 	cp := best.prekey
-	return &cp, nil
+	return &cp
 }
 
 func (s *Store) CountAvailablePreKeys(_ context.Context, userID string, deviceID int) (int, error) {
@@ -382,6 +392,25 @@ func (s *Store) RecordPreKeyIssuance(_ context.Context, targetUserID string, tar
 	k := issuanceKey{targetUserID: targetUserID, targetDeviceID: targetDeviceID, windowStart: windowStart}
 	s.issuances[k] = issuance{prekey: prekey, issuedAt: s.now()}
 	return nil
+}
+
+// IssueOneTimePreKey returns the OTPK already issued for the (target, window)
+// bucket, or takes and records a fresh one, holding the store lock for the
+// whole step so concurrent fetches share one OTPK (audit F-27).
+func (s *Store) IssueOneTimePreKey(_ context.Context, targetUserID string, targetDeviceID int, windowStart time.Time) (*storage.OneTimePreKey, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := issuanceKey{targetUserID: targetUserID, targetDeviceID: targetDeviceID, windowStart: windowStart}
+	if iss, ok := s.issuances[k]; ok {
+		p := iss.prekey
+		return &p, nil
+	}
+	p := s.takeOneTimePreKeyLocked(targetUserID, targetDeviceID)
+	if p == nil {
+		return nil, nil // exhausted
+	}
+	s.issuances[k] = issuance{prekey: *p, issuedAt: s.now()}
+	return p, nil
 }
 
 func (s *Store) PrunePreKeyIssuances(_ context.Context, before time.Time) (int, error) {
@@ -436,16 +465,23 @@ func (s *Store) ListMessages(_ context.Context, userID string, deviceID int, now
 	return out, nil
 }
 
-// PendingMessages returns future-due messages ordered by release time
-// (TASK-001 B).
-func (s *Store) PendingMessages(_ context.Context, now time.Time, limit int) ([]storage.Message, error) {
+// PendingMessages returns future-due messages ordered by (not_before, id) and
+// strictly after the cursor (TASK-001 B, audit F-28).
+func (s *Store) PendingMessages(_ context.Context, now time.Time, afterNotBefore time.Time, afterID string, limit int) ([]storage.Message, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	var out []storage.Message
 	for _, m := range s.messages {
-		if m.NotBefore.After(now) {
-			out = append(out, *cloneMessage(m))
+		if !m.NotBefore.After(now) {
+			continue
 		}
+		if m.NotBefore.Before(afterNotBefore) {
+			continue
+		}
+		if m.NotBefore.Equal(afterNotBefore) && m.ID <= afterID {
+			continue
+		}
+		out = append(out, *cloneMessage(m))
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].NotBefore.Equal(out[j].NotBefore) {

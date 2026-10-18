@@ -92,6 +92,12 @@ type Store interface {
 	// requester is never recorded (TASK-001 C, §7.2.1).
 	GetPreKeyIssuance(ctx context.Context, targetUserID string, targetDeviceID int, windowStart time.Time) (*OneTimePreKey, time.Time, error)
 	RecordPreKeyIssuance(ctx context.Context, targetUserID string, targetDeviceID int, windowStart time.Time, prekey OneTimePreKey) error
+	// IssueOneTimePreKey atomically returns the OTPK already issued for the
+	// (target, window) bucket, or takes and records a fresh one — all within a
+	// single transaction/lock so concurrent fetches share one OTPK per window
+	// (audit F-27). It returns a nil prekey (no error) when the pool is
+	// exhausted and no issuance exists for the window.
+	IssueOneTimePreKey(ctx context.Context, targetUserID string, targetDeviceID int, windowStart time.Time) (*OneTimePreKey, error)
 	// PrunePreKeyIssuances deletes issuance records older than before and
 	// reports how many were removed, so the §7.2.1 idempotency table cannot
 	// grow without bound (audit F-02 residual).
@@ -103,7 +109,10 @@ type Store interface {
 	AckMessage(ctx context.Context, userID string, deviceID int, id string) error
 	DeleteMessagesForDevice(ctx context.Context, userID string, deviceID int) error
 	DeleteExpiredMessages(ctx context.Context, now time.Time) (int, error)
-	// PendingMessages returns messages whose release time is still in the
-	// future (not_before > now), for scheduling post-restart notifications.
-	PendingMessages(ctx context.Context, now time.Time, limit int) ([]Message, error)
+	// PendingMessages returns up to limit messages whose release time is still
+	// in the future (not_before > now), ordered by (not_before, id) and
+	// strictly after the cursor (afterNotBefore, afterID) — pass the zero
+	// cursor for the first page. The keyset cursor keeps post-restart
+	// recovery linear in the backlog size (audit F-28).
+	PendingMessages(ctx context.Context, now time.Time, afterNotBefore time.Time, afterID string, limit int) ([]Message, error)
 }
