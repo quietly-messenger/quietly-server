@@ -6,6 +6,12 @@
 // burst of submitted messages cannot pin unbounded goroutines or memory.
 // Notifications are best-effort hints: a dropped or lost notification only
 // delays the wakeup, because the device still fetches its queue on connect.
+//
+// With jitter enabled, deliveries are serialized on the sweep goroutine, so
+// one slow (half-open) socket can delay every notification queued behind it
+// (audit F-35). This is accepted while the default `delivery_jitter_ms` is 0
+// (deliveries then happen on the submit path, as before the delta); revisit
+// with a bounded worker pool if the jitter default is ever raised.
 package notify
 
 import (
@@ -25,7 +31,7 @@ type Deliver func(userID string, deviceID int, env api.Envelope)
 
 // PendingStore is the storage subset Recover needs.
 type PendingStore interface {
-	PendingMessages(ctx context.Context, now time.Time, limit int) ([]storage.Message, error)
+	PendingMessages(ctx context.Context, now time.Time, afterNotBefore time.Time, afterID string, limit int) ([]storage.Message, error)
 }
 
 // DefaultSweep is how often the scheduler checks for due notifications. The
@@ -143,12 +149,16 @@ func (s *Scheduler) Close() {
 
 // Recover re-schedules notifications for messages that were still unreleased
 // at the previous shutdown (not_before > now), so a restart does not strand
-// them. The queue is bounded, so an overwhelming backlog is handled in batches
-// and the remainder drops (as with any in-process notification).
+// them. Pages advance a keyset cursor over (not_before, id), so the walk is
+// linear in the backlog size and terminates even when the pending set does not
+// drain (audit F-28). The notification queue is bounded, so an overwhelming
+// backlog still drops the overflow (as with any in-process notification).
 func (s *Scheduler) Recover(ctx context.Context, store PendingStore) error {
 	const batch = 1000
+	var afterNotBefore time.Time
+	var afterID string
 	for {
-		msgs, err := store.PendingMessages(ctx, s.now(), batch)
+		msgs, err := store.PendingMessages(ctx, s.now(), afterNotBefore, afterID, batch)
 		if err != nil {
 			return err
 		}
@@ -158,6 +168,8 @@ func (s *Scheduler) Recover(ctx context.Context, store PendingStore) error {
 		for _, m := range msgs {
 			s.Schedule(m.RecipientUserID, m.RecipientDeviceID, EnvelopeFor(m), m.NotBefore)
 		}
+		last := msgs[len(msgs)-1]
+		afterNotBefore, afterID = last.NotBefore, last.ID
 		if len(msgs) < batch {
 			return nil
 		}
