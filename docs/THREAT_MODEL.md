@@ -112,12 +112,14 @@ request times unless deliberately configured not to (§17).
 
 ## Out of scope for v1 (not claimed)
 
-Cover traffic, padding, timing obfuscation; protection against a global
-passive adversary; quantum resistance; formal verification; external audit
-(**required before public beta**, §17.1). When media, calls, and backups land
-they each need a threat-model update — a TURN relay sees IP pairs and
-traffic shape, media blobs leak sizes, and backup recovery phrases become a
-new key-management surface.
+Cover traffic; timing obfuscation beyond `delivery_jitter_ms` (which exists,
+default 0); protection against a global passive adversary; quantum resistance;
+formal verification; external audit (**required before public beta**, §17.1).
+Size padding is implemented and specified in §16.1 — it removes the length
+signal for compliant clients, and it is not server-enforced. When media,
+calls, and backups land they each need a threat-model update — a TURN relay
+sees IP pairs and traffic shape, media blobs leak sizes, and backup recovery
+phrases become a new key-management surface.
 
 ## Gates before public registration
 

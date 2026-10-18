@@ -160,7 +160,7 @@ The server is configured entirely through environment variables. See `.env.examp
 | `LOG_LEVEL` | `debug`/`info`/`warn`/`error` | `info` |
 | `POW_DIFFICULTY` | account-creation proof-of-work leading zero bits (raise before public registration — §4.3) | `20` |
 | `TLS_CERT_FILE` / `TLS_KEY_FILE` | terminate TLS 1.3 in-process (or leave unset behind a TLS proxy) | — |
-| `BUNDLE_FETCH_PER_HOUR` | per-address prekey-bundle limit (bundle fetch is unauthenticated — §12.7) | `60` |
+| `BUNDLE_FETCH_PER_HOUR` | per-address limit on each unauthenticated first-contact fetch — prekey bundle, username lookup, delivery token (§12.6–12.8) | `60` |
 | `DELIVERY_JITTER_MS` | max server-side hold before a message is delivered (0 disables; partial timing mitigation — §17) | `0` |
 | `REQUESTS_PER_MINUTE` | per-IP request limit for the HTTP surface | `120` |
 | `TRUSTED_PROXIES` | IPs/CIDRs of reverse proxies whose `X-Forwarded-For` may key the per-IP limiter (empty: header always ignored — audit F-23) | empty |
@@ -179,7 +179,7 @@ The trust service additionally uses `TRUST_ADMIN_TOKEN` (required — admin bear
 
 **The normative specification is [`api/v1/PROTOCOL.md`](./api/v1/PROTOCOL.md).** It defines every byte on the wire — key formats, binary layouts, KDF inputs, error codes, and limits. Where this README and that document disagree, the specification is right.
 
-Most requests are authenticated by having each device sign them with its Ed25519 identity key — there is no password and no session token. Message submission is the exception: it is unauthenticated by design, because a signature would identify the sender and defeat sealed sender. It is gated by a per-device delivery token instead.
+Most requests are authenticated by having each device sign them with its Ed25519 identity key — there is no password and no session token. Two groups are unauthenticated by design: message submission (a signature would identify the sender and defeat sealed sender; it is gated by a per-device delivery token instead) and the first-contact endpoints — username lookup, prekey-bundle fetch, and delivery-token fetch (§12.6–12.8, TASK-001 C; requiring a signature would tie the initiator's identity to the fetch and defeat first-contact unlinkability, §7.2.1).
 
 Endpoints at MVP stage:
 
@@ -190,9 +190,9 @@ Endpoints at MVP stage:
 | `POST /v1/devices` | existing device |
 | `GET /v1/devices` | device |
 | `DELETE /v1/devices/{device_id}` | device |
-| `GET /v1/users/{username}` | device |
-| `GET /v1/devices/{user_id}/{device_id}/prekey-bundle` | device |
-| `GET /v1/devices/{user_id}/{device_id}/delivery-token` | device |
+| `GET /v1/users/{username}` | none (§12.6) |
+| `GET /v1/devices/{user_id}/{device_id}/prekey-bundle` | none (§12.7) |
+| `GET /v1/devices/{user_id}/{device_id}/delivery-token` | none (§12.8) |
 | `POST /v1/devices/{device_id}/prekeys` | that device |
 | `PUT /v1/devices/{device_id}/signed-prekey` | that device |
 | `PUT /v1/devices/{device_id}/delivery-token` | that device |

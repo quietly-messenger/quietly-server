@@ -219,6 +219,13 @@ func (s *Server) revokeDevice(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) lookupUser(w http.ResponseWriter, r *http.Request) {
+	// §12.6 is the entry point of the username-sweep enumeration path; meter
+	// it per address like the bundle fetch it nearly always precedes (F-34).
+	if !s.bundleLimiter.Allow("lookup:" + s.clientIP(r)) {
+		w.Header().Set("Retry-After", "3600")
+		api.WriteError(w, api.Errorf(api.CodeRateLimited, "user lookup limit reached"))
+		return
+	}
 	resp, err := s.accounts.Lookup(r.Context(), chi.URLParam(r, "username"))
 	if err != nil {
 		api.WriteError(w, err)
@@ -258,6 +265,14 @@ func (s *Server) preKeyBundle(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) deliveryToken(w http.ResponseWriter, r *http.Request) {
+	// §12.8 hands a spam credential to any caller; meter it per address too
+	// (F-34). A §12.13 delivery_rejected retry needs at most one refetch, well
+	// inside the hourly budget.
+	if !s.bundleLimiter.Allow("token:" + s.clientIP(r)) {
+		w.Header().Set("Retry-After", "3600")
+		api.WriteError(w, api.Errorf(api.CodeRateLimited, "delivery token limit reached"))
+		return
+	}
 	deviceID, err := pathInt(r, "device_id")
 	if err != nil {
 		api.WriteError(w, err)

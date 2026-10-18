@@ -295,6 +295,51 @@ func TestPerIPRateLimit(t *testing.T) {
 	t.Fatal("third request was not rate limited")
 }
 
+// TestFirstContactFetchBudgets is the permanent regression for audit F-34:
+// §12.6 (username lookup) and §12.8 (delivery token) get their own per-address
+// hourly budgets, on top of the pre-existing bundle-fetch meter, and an
+// attacker-uniquified X-Forwarded-For must not mint fresh buckets (F-23
+// inheritance).
+func TestFirstContactFetchBudgets(t *testing.T) {
+	limits := testutil.Limits()
+	limits.BundleFetchPerHour = 2 // burst of 2: the third fetch per endpoint must 429
+	h, store := newRouter(t, limits)
+	bob := testutil.NewAccount(t, store, limits, "bob", 1)
+
+	budget := func(t *testing.T, path string) []int {
+		t.Helper()
+		var codes []int
+		for i := 0; i < 3; i++ {
+			req := mustRequest(t, http.MethodGet, path, nil)
+			req.Header.Set("X-Forwarded-For", "9.9.9."+itoa(i)) // nil TRUSTED_PROXIES: must be ignored
+			w := testutil.Do(h, req)
+			codes = append(codes, w.Code)
+			if w.Code == http.StatusTooManyRequests {
+				if w.Header().Get("Retry-After") == "" {
+					t.Fatal("429 without Retry-After")
+				}
+				if code := testutil.ErrorCode(t, w); code != api.CodeRateLimited {
+					t.Fatalf("code=%s", code)
+				}
+			}
+		}
+		return codes
+	}
+
+	devicePath := "/v1/devices/" + bob.UserID + "/" + itoa(bob.DeviceID)
+	check := func(t *testing.T, name string, codes []int) {
+		t.Helper()
+		if codes[0] != http.StatusOK || codes[1] != http.StatusOK || codes[2] != http.StatusTooManyRequests {
+			t.Fatalf("%s statuses = %v, want [200 200 429]", name, codes)
+		}
+	}
+	// Each endpoint has its own budget keyed by prefix: exhausting one must not
+	// spill into the others.
+	check(t, "lookup", budget(t, "/v1/users/bob"))
+	check(t, "token", budget(t, devicePath+"/delivery-token"))
+	check(t, "bundle", budget(t, devicePath+"/prekey-bundle"))
+}
+
 func mustRequest(t *testing.T, method, path string, body []byte) *http.Request {
 	t.Helper()
 	var r io.Reader

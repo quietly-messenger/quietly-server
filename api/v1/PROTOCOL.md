@@ -250,9 +250,12 @@ The nonce cache holds entries for `auth_skew_ms × 2`, which bounds it: a nonce 
 | `GET /v1/accounts/pow-params` | none |
 | `POST /v1/accounts` | self-signed by the new device 1, plus PoW |
 | `POST /v1/messages` | **none** — delivery token instead (§6) |
+| `GET /v1/users/{username}` | none (TASK-001 C, §12.6) |
+| `GET /v1/devices/{user_id}/{device_id}/prekey-bundle` | none (TASK-001 C, §12.7) |
+| `GET /v1/devices/{user_id}/{device_id}/delivery-token` | none (TASK-001 C, §12.8) |
 | everything else | signed by an active device |
 
-`POST /v1/messages` is deliberately unauthenticated. Signing it would reveal the sender to the server and defeat sealed sender.
+`POST /v1/messages` is deliberately unauthenticated. Signing it would reveal the sender to the server and defeat sealed sender. The first-contact endpoints are unauthenticated for the same reason (§7.2.1): requiring a signature would tie the initiator's identity to the fetch and reintroduce the link C2 removes.
 
 ---
 
@@ -340,7 +343,7 @@ This is a real loss, and it must be stated precisely. The Double Ratchet's forwa
 
 Four mandatory mitigations:
 
-1. **Per-IP rate limit** on bundle fetch (`bundle_fetch_per_hour`, keyed on source address now that bundle fetch is unauthenticated — §12.7, TASK-001 C). Behind an OHTTP-style relay every client shares an address, so this degrades to a per-relay budget; the anti-drain guarantee is carried by mitigation 2, not this one.
+1. **Per-IP rate limit** on the unauthenticated first-contact fetches (`bundle_fetch_per_hour`, keyed on source address — §12.6–12.8, TASK-001 C). Behind an OHTTP-style relay every client shares an address, so this degrades to a per-relay budget; the anti-drain guarantee is carried by mitigation 2, not this one.
 2. **Per-(target, window) idempotency.** Bundle fetch records no requester. Repeat fetches for the same target device within a fixed `otp_idempotency_window_h` bucket return the **same** one-time prekey rather than consuming another, so a session needs exactly one bundle and retries, reinstalls, and rotations must not cost key material. This bounds the drain to **one OTPK per target per window** regardless of how many distinct clients fetch (two fetches straddling a bucket boundary may consume two).
 
    The cost is a documented forward-secrecy relaxation of the **initial** secret: every session established against the same target inside one window uses the same one-time prekey, so an adversary who later compromises the target's `identity_key_dh` and that window's one-time-prekey private half can reconstruct all of them. Established-session forward secrecy is unaffected, and the exposure is bounded by `spk_rotation_days` like any prekey-based establishment.
@@ -707,13 +710,13 @@ Response `204`.
 
 ### 12.6 `GET /v1/users/{username}`
 
-Unauthenticated (TASK-001 C). Resolves a username to its routing identity and active devices.
+Unauthenticated (TASK-001 C). Resolves a username to its routing identity and active devices. This lookup is the entry point of the practical enumeration path: usernames are human-guessable, so the binding constraint is the per-IP meter, not `user_id` secrecy (§17.1).
 
 ```json
 { "v": "quietly/1", "user_id": "7c9e6679-...", "username": "bob", "devices": [ 1, 3 ] }
 ```
 
-Errors: `user_not_found`. The response for a nonexistent username is byte-identical to that for a reserved or deleted one.
+Errors: `user_not_found`, `rate_limited`. The response for a nonexistent username is byte-identical to that for a reserved or deleted one.
 
 ### 12.7 `GET /v1/devices/{user_id}/{device_id}/prekey-bundle`
 
@@ -776,7 +779,7 @@ Errors about the **recipient**: exactly one code, `delivery_rejected` (403), cov
 This endpoint is unauthenticated, so distinguishing those cases would hand any anonymous caller an oracle over the state of somebody else's device. Anyone who ever held a token could learn that a device had been revoked. The server MUST therefore:
 
 - return the identical body and status for every recipient-state failure
-- avoid distinguishable fast paths where practical: the implementation performs the same token comparison for an existing device and a missing one, but internal work still differs (a database hit versus a miss), so timing MUST be treated as non-authoritative rather than claimed constant. `user_id` secrecy is what raises the cost of enumeration.
+- avoid distinguishable fast paths where practical: the implementation performs the same token comparison for an existing device and a missing one, but internal work still differs (a database hit versus a miss), so timing MUST be treated as non-authoritative rather than claimed constant. The practical enumeration path is a username sweep through the unauthenticated lookup (§12.6), bounded only by the per-IP meter on the lookup and token fetches — `user_id` unguessability is only the second step (§17.1).
 
 A client receiving `delivery_rejected` refetches the delivery token (§12.8), and if that also fails, refetches the bundle (§12.7). Both are unauthenticated, so they may return a precise cause to the caller — but only for a device the caller already names by `user_id`/`device_id`; this trades a device-state oracle against the unguessability of `user_id` (documented in §17), not against a per-request token.
 
@@ -903,7 +906,7 @@ Error responses MUST NOT leak whether a username exists beyond what `user_not_fo
 | `otp_replenish_threshold` | 20 | client tops up below this |
 | `otp_max_stored` | 200 | server cap per device |
 | `sealed_blob_max` | 64 KiB | text-only milestone; `payload_too_large` above |
-| `delivery_jitter_ms` | 0 | max randomized hold before a message is fetchable/notifiable (0 disables; hard cap 5000) — §17, TASK-001 B |
+| `delivery_jitter_ms` | 0 | max randomized hold before a message is fetchable/notifiable (0 disables; hard cap 5000). Production deployments with non-trivial traffic should set 500–1000 ms — §17, TASK-001 B |
 | `message_ttl_days` | 30 | undelivered messages expire |
 | `auth_skew_ms` | ±60 000 | request timestamp window |
 | `nonce_cache_ms` | 120 000 | twice the skew window |
@@ -911,7 +914,7 @@ Error responses MUST NOT leak whether a username exists beyond what `user_not_fo
 | `pow_window_ms` | ±300 000 | solving takes time |
 | `spk_rotation_days` | 3 | signed prekey rotation; short to bound §7.2.1 exposure |
 | `spk_grace_days` | 3 | previous signed prekey stays valid |
-| `bundle_fetch_per_hour` | 60 | per source address (bundle fetch is unauthenticated — §12.7); behind a relay, per relay |
+| `bundle_fetch_per_hour` | 60 | per source address, applied separately to each unauthenticated first-contact fetch: prekey bundle, username lookup, delivery token (§12.6–12.8); behind a relay, per relay |
 | `otp_idempotency_window_h` | 24 | one OTPK per target per fixed window, shared by every fetch in it (§7.2.1, TASK-001 C) |
 | `sealed_nonce_bytes` | 24 | XChaCha20-Poly1305, random per message |
 | `max_skip_per_chain` | 1 000 | client-side ratchet limit |
@@ -981,7 +984,9 @@ families.
 Padding is implemented once in `quietly-crypto` (`protocol.PadToBucket` /
 `Unpad`, and `ffi.quietly_pad_payload` / `quietly_unpad_payload`) and MUST NOT
 be re-implemented in any client. The server never parses the framing; it only
-ever observes sealed-blob lengths that land in the bucket set.
+ever observes sealed-blob lengths that land in the bucket set — for compliant
+clients. Nothing server-side enforces conformance yet, so a non-padded build
+still leaks the old length signal (status note, §17).
 
 Cover traffic (fixed-rate decoy submissions) is **not** implemented and remains
 a documented residual in §17; its design is sketched in
@@ -1011,6 +1016,8 @@ The server **cannot** observe:
 
 Not addressed, and not claimed: cover traffic, or protection against a global passive adversary correlating both ends. Size padding (§16.1) removes the length signal. Delivery jitter (§15 `delivery_jitter_ms`) inserts a server-side randomized hold between enqueue and delivery, which weakens upload↔delivery timing correlation; it is a **partial** mitigation, not a fix: a *client-side* delay before upload is a no-op against a network observer (it moves the observable event itself — both ends shift together, so the correlation gap is unchanged), and with no cover traffic a low-traffic deployment remains trivially correlatable. The remaining signals are *who* talks to *whom* and *when*.
 
+Anonymous callers can also probe and poke a target's prekey state: every bundle fetch returns `one_time_prekeys_remaining` (§7.2), a live oracle over the drain-and-refill cycle, and a fetch that finds the pool low can drive `prekeys_low`/`spk_rotate` nudges at the target (per-IP bounded). Both are inherent to the C2 shape, where the fetch carries no requester identity (§7.2.1).
+
 Deployment reality belongs on this list too. Any reverse proxy, load balancer, TLS terminator, or container platform in front of the home server **logs source IP addresses and request times unless explicitly configured not to**. The register above describes the protocol, not the deployment; an operator's logging configuration is part of the metadata story, and self-hosting is only as private as the box it runs on.
 
 ### 17.1 Accepted residual risks
@@ -1029,5 +1036,5 @@ Stated so they are decisions rather than oversights:
 | Size padding adds ~4 KiB worst-case for messages near the top of a bucket (§16.1) | Accepted as the cost of removing the length signal; buckets are configurable client-side. |
 | Delivery jitter is partial (§15) | Accepted: a randomized server-side hold weakens but does not break timing correlation. Cover traffic is a separate, later task. |
 | One OTPK per target per window (§7.2.1) | Accepted: a per-window forward-secrecy relaxation of the initial secret, chosen to bound the drain on unauthenticated fetch. Revisited with §16 anonymous tokens. |
-| Unauthenticated fetches expose device existence/revocation by `user_id` (§12.7, §12.8) | Accepted: `user_id` is a random UUID, so enumeration is not free; the precise-cause responses are a deliberate part of C2. |
+| Unauthenticated fetches expose device existence/revocation by `user_id`, and a username sweep reaches a delivery token with no account (§12.6–12.8) | Accepted: the practical enumeration vector is usernames (human-guessable, bounded only by the per-IP meter on lookup/token fetches) — `user_id` is a random UUID, but that is only the second step. C2 removed the account-creation (PoW) barrier to token harvest; the reserved §16 anonymous-token direction is the eventual barrier. The precise-cause responses are a deliberate part of C2. |
 | First-contact correlation by source address remains (§17) | Accepted for C2: identity linkage is gone, address+timing linkage is not. §16 reserves relays/tokens for it. |
